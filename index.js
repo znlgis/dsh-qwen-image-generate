@@ -29,7 +29,7 @@
  * @module dsh-qwen-image
  */
 
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative as relativePath, resolve as resolvePath, sep } from 'node:path'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -55,7 +55,24 @@ const DEFAULT_VIDEO_POLL_INTERVAL_MS = 5_000
  */
 const DEFAULT_VIDEO_WAIT_MS = 90_000
 const DEFAULT_SIZE = '1024*1024'
-const DEFAULT_TIMEOUT_MS = 180_000
+/**
+ * Per-request budget for the synchronous image endpoint. Kept under the host's
+ * default 120 s per-call timeout for the same reason videoWaitMs is: a budget
+ * longer than the host allows means the exchange is killed before this plugin
+ * can report anything, and a synchronous image call has no task id to resume,
+ * so a paid result is simply lost.
+ */
+const DEFAULT_TIMEOUT_MS = 110_000
+/** Hard cap on images one call may produce, whatever the parameter shape. */
+const MAX_IMAGES_PER_CALL = 6
+/** Attempts (including the first) for one retryable image request or download. */
+const MAX_IMAGE_ATTEMPTS = 3
+/** First retry delay; doubles per attempt and honours a Retry-After hint. */
+const IMAGE_RETRY_DELAY_MS = 800
+/** How many prompt requests one batch call may keep in flight. */
+const IMAGE_BATCH_CONCURRENCY = 3
+/** JSONL ledger of generated files, appended in the output directory. */
+const MANIFEST_FILE = '.manifest.jsonl'
 
 /** Models documented for the Token Plan image endpoint. */
 const KNOWN_MODELS = [
@@ -406,23 +423,143 @@ function combineSignals(caller, timeout) {
   return controller.signal
 }
 
+/** The file-name part of a path, whatever the platform separator. */
+function baseNameOf(path) {
+  const separator = String.fromCharCode(92)
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf(separator))
+  return cut === -1 ? path : path.slice(cut + 1)
+}
+
+/** Whether a failed image step may be retried instead of surfaced. */
+function isTransientImageError(error) {
+  if (error?.code === 'QWEN_IMAGE_NETWORK') return true
+  if (error?.code !== 'QWEN_IMAGE_REQUEST_FAILED' && error?.code !== 'QWEN_IMAGE_DOWNLOAD_FAILED') return false
+  return error.status === 429 || (Number.isInteger(error.status) && error.status >= 500)
+}
+
+/** Wait before one image retry, honouring a Retry-After hint. */
+function imageRetryDelay(error, attempt) {
+  const hinted = Number(error?.retryAfterMs)
+  if (Number.isFinite(hinted) && hinted > 0) return Math.min(hinted, MAX_RETRY_DELAY_MS)
+  return Math.min(IMAGE_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS)
+}
+
+/**
+ * Run one image request or download with bounded retries. Image calls are the
+ * expensive half of this plugin, so a dropped connection must not throw away a
+ * paid result: retryable failures are retried here instead of reaching the
+ * model, while cancellation still wins because the wait honours the signal.
+ */
+async function withImageRetry(run, signal) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run()
+    } catch (error) {
+      if (isAbortError(error) || !isTransientImageError(error) || attempt >= MAX_IMAGE_ATTEMPTS) throw error
+      await sleep(imageRetryDelay(error, attempt), signal)
+    }
+  }
+}
+
+/**
+ * Whether a 400 means the model rejected the batch count field. A prompt that
+ * the provider merely refuses must not be retried once per image, so the
+ * fallback only triggers when the message names that parameter.
+ */
+function isBatchCountRejected(error) {
+  if (error?.status !== 400) return false
+  const message = String(error?.message ?? '').toLowerCase()
+  const named = ['batch', 'count', 'number', 'parameter', 'not support', 'unsupported']
+  if (named.some((token) => message.includes(token))) return true
+  return message.split(' ').some((token) => token === 'n' || token === 'n,' || token === 'n.')
+}
+
+/** One file-stem component: no separators, no reserved names, bounded length. */
+function sanitizeFileStem(value) {
+  const illegal = new Set(['/', ':', '*', '?', '"', '<', '>', '|', String.fromCharCode(92)])
+  let cleaned = ''
+  for (const character of value.normalize('NFC')) {
+    const code = character.codePointAt(0)
+    if (code < 32 || illegal.has(character) || character.trim() === '') cleaned += '_'
+    else cleaned += character
+  }
+  cleaned = cleaned.replace(/^[._]+/u, '').replace(/[._]+$/u, '').slice(0, 60)
+  if (cleaned === '' || cleaned === '.' || cleaned === '..') return undefined
+  return cleaned
+}
+
+/** Map with a concurrency cap, preserving order and collecting each outcome. */
+async function mapSettled(items, limit, run) {
+  const outcomes = new Array(items.length)
+  let next = 0
+  const worker = async () => {
+    for (;;) {
+      const index = next
+      next += 1
+      if (index >= items.length) return
+      try {
+        outcomes[index] = { status: 'fulfilled', value: await run(items[index], index) }
+      } catch (error) {
+        outcomes[index] = { status: 'rejected', reason: error }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return outcomes
+}
+
+/** Validate and normalize the model-supplied arguments. */
 /** Validate and normalize the model-supplied arguments. */
 function parseArgs(args, config) {
   if (args === null || typeof args !== 'object') throw new ImageArgsError('arguments must be an object')
   const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
-  if (prompt === '') throw new ImageArgsError('prompt must be a non-empty string')
+  const rawPrompts = args.prompts
+  let prompts
+  if (rawPrompts !== undefined) {
+    if (!Array.isArray(rawPrompts) || rawPrompts.length === 0 || rawPrompts.length > MAX_IMAGES_PER_CALL) {
+      throw new ImageArgsError('prompts must be an array of 1 to ' + MAX_IMAGES_PER_CALL + ' non-empty strings')
+    }
+    prompts = rawPrompts.map((entry, index) => {
+      if (!isNonBlankString(entry)) throw new ImageArgsError('prompts[' + index + '] must be a non-empty string')
+      return entry.trim()
+    })
+    if (prompt !== '') throw new ImageArgsError('pass either prompt (one string) or prompts (a list of them), not both')
+  } else if (prompt === '') {
+    throw new ImageArgsError('prompt must be a non-empty string (pass prompts to draw several different images in one call)')
+  }
 
   const model = isNonBlankString(args.model) ? args.model.trim() : config.defaultModel
   if (!KNOWN_MODELS.includes(model)) {
-    throw new ImageArgsError(`model "${model}" is not a Token Plan image model; use one of ${KNOWN_MODELS.join(', ')}`)
+    throw new ImageArgsError('model "' + model + '" is not a Token Plan image model; use one of ' + KNOWN_MODELS.join(', '))
   }
   const size = isNonBlankString(args.size) ? args.size.trim() : config.defaultSize
-  if (!/^\d{2,5}\*\d{2,5}$/u.test(size)) {
-    throw new ImageArgsError(`size "${size}" must look like 1024*1024 (width*height)`)
+  if (!/^[0-9]{2,5}[*][0-9]{2,5}$/u.test(size)) {
+    throw new ImageArgsError('size "' + size + '" must look like 1024*1024 (width*height)')
   }
   const count = args.count === undefined ? 1 : args.count
-  if (!Number.isInteger(count) || count < 1 || count > 6) {
-    throw new ImageArgsError('count must be an integer from 1 to 6')
+  if (!Number.isInteger(count) || count < 1 || count > MAX_IMAGES_PER_CALL) {
+    throw new ImageArgsError('count must be an integer from 1 to ' + MAX_IMAGES_PER_CALL)
+  }
+  const promptCount = prompts === undefined ? 1 : prompts.length
+  const total = promptCount * count
+  if (total > MAX_IMAGES_PER_CALL) {
+    throw new ImageArgsError('one call may produce at most ' + MAX_IMAGES_PER_CALL + ' images: ' + promptCount + ' prompt(s) x ' + count + ' asks for ' + total)
+  }
+  const sourceNames = args.name_prefix
+  let namePrefixes
+  if (sourceNames !== undefined) {
+    const list = Array.isArray(sourceNames) ? sourceNames : [sourceNames]
+    if (list.some((entry) => !isNonBlankString(entry))) {
+      throw new ImageArgsError('name_prefix must be a non-empty string or an array of them')
+    }
+    if (Array.isArray(sourceNames) && sourceNames.length !== total) {
+      throw new ImageArgsError('name_prefix as an array needs one name per image (' + total + '), got ' + sourceNames.length)
+    }
+    namePrefixes = list.map((entry) => {
+      const stem = sanitizeFileStem(entry.trim())
+      if (stem === undefined) throw new ImageArgsError('name_prefix "' + entry + '" has no usable file-name characters')
+      return stem
+    })
   }
   const seed = args.seed
   if (seed !== undefined && (!Number.isInteger(seed) || seed < 0 || seed > 2_147_483_647)) {
@@ -440,6 +577,9 @@ function parseArgs(args, config) {
   }
   return {
     prompt,
+    prompts,
+    namePrefixes,
+    namePrefixIsList: Array.isArray(sourceNames),
     model,
     size,
     count,
@@ -764,18 +904,30 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register({
     name: 'qwen_image_generate',
-    description: 'Generate images from a text prompt with the Qwen Token Plan image models '
+    description: 'Generate images from one prompt, or draw several different subjects in a single call '
       + '(wan2.7-image-pro by default, plus qwen-image-3.0-pro and others), save them to the session workspace, and return their paths. '
-      + 'Pass image_urls to edit existing images with an image-capable model. A count above 1 falls back to one request '
-      + 'per image when the service rejects the batch field. Generation takes tens of seconds.',
+      + 'Use prompts (up to 6 entries) for a whole set, or count to redraw one prompt. name_prefix names the files, '
+      + 'and every call appends a manifest recording the prompt and parameters. Pass image_urls to edit existing images. '
+      + 'Generation takes tens of seconds per image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['prompt'],
       properties: {
         prompt: {
           type: 'string',
-          description: 'What to draw, as a full image description. Up to a few thousand tokens; longer prompts are truncated.',
+          description: 'What to draw, as a full image description. Up to a few thousand tokens; longer prompts are truncated. Pass prompts instead to draw several different images in one call.',
+        },
+        prompts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Several different subjects in one call: 1 to 6 prompts, one image per prompt (count redraws each). One request per prompt; a failed prompt is reported in warnings while the others still return.',
+        },
+        name_prefix: {
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' } },
+          ],
+          description: 'Base file name(s) for the saved images. A string prefixes every file (cat gives cat_01.png); an array names each image in order and must match the image count. Defaults to qwen_<timestamp>_<n>.',
         },
         model: {
           type: 'string',
@@ -788,11 +940,11 @@ export function apply(ctx, rawConfig) {
         },
         count: {
           type: 'integer',
-          description: 'How many images to produce, 1 through 6. Defaults to 1.',
+          description: 'How many images to produce per prompt, 1 through 6. Defaults to 1; prompts x count must stay within 6 images per call.',
         },
         negative_prompt: {
           type: 'string',
-          description: 'What must not appear in the image, for models that support it. At most 500 characters.',
+          description: 'What must not appear in the image. Only the qwen-image-3.0 series accepts this parameter; other models ignore it and the result reports a warning. At most 500 characters.',
         },
         image_urls: {
           type: 'array',
@@ -839,9 +991,16 @@ export function apply(ctx, rawConfig) {
                 mediaType: { type: 'string', description: 'Saved image media type.' },
                 attachmentId: { type: 'string', description: 'Durable attachment reference when the image is also shown in the chat.' },
                 attachmentBytes: { type: 'integer', description: 'Normalized attachment byte size; the chat image block uses this, not the saved file size.' },
+                promptIndex: { type: 'integer', description: 'Index of the prompt in prompts that produced this image (0 for a single prompt).' },
               },
             },
           },
+          warnings: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Non-fatal notes: an ignored parameter, a failed prompt in a multi-prompt call, a rejected batch count, or a skipped download.',
+          },
+          manifestPath: { type: 'string', description: 'JSONL ledger recording every saved file with its prompt and parameters; appended in the output directory.' },
           rewriteStatus: { type: 'string', description: 'Prompt-rewrite status reported by the service, when present.' },
         },
       },
@@ -866,6 +1025,12 @@ export function apply(ctx, rawConfig) {
             },
           })
         }
+        if (Array.isArray(value.warnings) && value.warnings.length > 0) {
+          blocks.push({
+            type: 'text',
+            text: '<warnings>' + String.fromCharCode(10) + value.warnings.map((warning) => '- ' + warning).join(String.fromCharCode(10)) + String.fromCharCode(10) + '</warnings>',
+          })
+        }
         return blocks
       },
       presentationMeta: (_args, value) => ({ paths: value.images.map((image) => image.path) }),
@@ -884,7 +1049,6 @@ export function apply(ctx, rawConfig) {
         baseUrl: config.baseUrl,
         apiKey,
         model: options.model,
-        prompt: options.prompt,
         size: options.size,
         negativePrompt: options.negativePrompt,
         seed: options.seed,
@@ -893,40 +1057,105 @@ export function apply(ctx, rawConfig) {
         images: options.images,
         signal,
       }
-      const bodies = []
-      try {
-        bodies.push(await requestGeneration({ ...request, count: options.count }))
-      } catch (error) {
-        // `n` is not portable across the image families: a batch ask the service
-        // rejects as a bad parameter still works as N single-image requests.
-        if (options.count <= 1 || error?.status !== 400) throw error
-        bodies.push(...await Promise.all(
-          Array.from({ length: options.count }, () => requestGeneration({ ...request, count: 1 })),
-        ))
+      const warnings = []
+
+      // Negative prompts are a qwen-image-3.0-series parameter and the other
+      // models reject unknown parameters, so the field is dropped there; report
+      // that instead of letting the caller believe the constraint took effect.
+      if (options.negativePrompt !== undefined && !options.model.startsWith('qwen-image-3.')) {
+        warnings.push('negative_prompt was not sent: only the qwen-image-3.0 series accepts it, so ' + options.model + ' ignored it - move the constraint into prompt or switch models.')
       }
-      const sources = []
+
+      const prompts = options.prompts ?? [options.prompt]
+      const requestOne = (prompt, count) => withImageRetry(
+        () => requestGeneration({ ...request, prompt, count }),
+        signal,
+      )
+
+      // One request per prompt. A model that rejects the batch count field is
+      // retried as N single requests, and finished images are kept even when a
+      // sibling request fails, so a paid result is never thrown away.
+      const batches = await mapSettled(prompts, IMAGE_BATCH_CONCURRENCY, async (prompt, promptIndex) => {
+        try {
+          return { promptIndex, prompt, bodies: [await requestOne(prompt, options.count)] }
+        } catch (error) {
+          if (options.count <= 1 || !isBatchCountRejected(error)) throw error
+          const settled = await Promise.allSettled(
+            Array.from({ length: options.count }, () => requestOne(prompt, 1)),
+          )
+          const bodies = settled.filter((entry) => entry.status === 'fulfilled').map((entry) => entry.value)
+          const failures = settled.filter((entry) => entry.status === 'rejected').map((entry) => entry.reason)
+          if (bodies.length === 0) throw failures[0] ?? error
+          warnings.push('the service rejected the batch count for prompt ' + (promptIndex + 1) + '; fell back to single requests (' + bodies.length + ' of ' + options.count + ' succeeded).')
+          return { promptIndex, prompt, bodies }
+        }
+      })
+
+      const produced = []
       let rewriteStatus
-      for (const body of bodies) {
-        const entries = imageEntriesOf(body)
-        const usage = body?.usage ?? {}
-        sources.push(...entries.images.map((source) => ({ source, usage })))
-        if (rewriteStatus === undefined) rewriteStatus = entries.rewriteStatus
+      for (const outcome of batches) {
+        if (outcome.status === 'rejected') {
+          warnings.push('one prompt request failed: ' + (outcome.reason?.message ?? String(outcome.reason)))
+          continue
+        }
+        const { promptIndex, prompt, bodies } = outcome.value
+        bodies.forEach((body, copyIndex) => {
+          const entries = imageEntriesOf(body)
+          if (rewriteStatus === undefined) rewriteStatus = entries.rewriteStatus
+          const usage = body?.usage ?? {}
+          const requestId = body?.request_id
+          entries.images.forEach((source, imageIndex) => {
+            produced.push({
+              source,
+              usage,
+              requestId,
+              prompt,
+              promptIndex,
+              slot: promptIndex * options.count + copyIndex + imageIndex,
+            })
+          })
+        })
       }
-      if (sources.length === 0) {
+      if (produced.length === 0) {
+        const firstFailure = batches.find((entry) => entry.status === 'rejected')
+        if (firstFailure !== undefined) {
+          throw firstFailure.reason instanceof Error ? firstFailure.reason : new QwenImageError(String(firstFailure.reason), 'QWEN_IMAGE_REQUEST_FAILED')
+        }
         throw new QwenImageError('the service returned no image; retry with a different prompt or model', 'QWEN_IMAGE_NO_IMAGE')
       }
 
       await mkdir(directory, { recursive: true })
       const batch = stamp()
+      // Downloading is the slow half and the images are independent, so every
+      // file is fetched at once; naming and writing stay sequential because the
+      // exclusive-create name check is what keeps concurrent calls apart.
+      const downloads = await Promise.all(produced.map(async (item) => {
+        try {
+          const downloaded = await withImageRetry(() => downloadImage(item.source, signal), signal)
+          return { ...item, ...downloaded }
+        } catch (error) {
+          return { ...item, error }
+        }
+      }))
+
       const saved = []
-      for (const [index, item] of sources.entries()) {
-        const { source, usage } = item
-        const { data, mediaType } = await downloadImage(source, signal)
-        const file = await writeUniqueFile(directory, `qwen_${batch}_${index + 1}`, extensionOf(mediaType), data)
-        const entry = { path: file, bytes: data.byteLength, mediaType }
+      const manifest = []
+      for (const item of downloads) {
+        if (item.error !== undefined) {
+          warnings.push('one image could not be downloaded: ' + (item.error?.message ?? String(item.error)))
+          continue
+        }
+        const fallbackStem = 'qwen_' + batch + '_' + (item.slot + 1)
+        const stem = options.namePrefixes === undefined
+          ? fallbackStem
+          : options.namePrefixIsList
+            ? (options.namePrefixes[item.slot] ?? fallbackStem)
+            : options.namePrefixes[0] + '_' + String(item.slot + 1).padStart(2, '0')
+        const file = await writeUniqueFile(directory, stem, extensionOf(item.mediaType), item.data)
+        const entry = { path: file, bytes: item.data.byteLength, mediaType: item.mediaType, promptIndex: item.promptIndex }
         if (acceptsImages && attachments !== undefined) {
           try {
-            const ref = await attachments.saveImage({ data, mediaType, name: file.split(/[\\/]/u).pop() })
+            const ref = await attachments.saveImage({ data: item.data, mediaType: item.mediaType, name: baseNameOf(file) })
             entry.attachmentId = ref.attachmentId
             // The attachment service normalizes the bytes it keeps, so the
             // durable reference carries the stored size that the request path
@@ -940,16 +1169,49 @@ export function apply(ctx, rawConfig) {
           }
         }
         if (entry.width === undefined) {
-          const width = usage.output_width ?? usage.width
-          const height = usage.output_height ?? usage.height
+          const width = item.usage.output_width ?? item.usage.width
+          const height = item.usage.output_height ?? item.usage.height
           if (Number.isInteger(width) && Number.isInteger(height)) {
             entry.width = width
             entry.height = height
           }
         }
         saved.push(entry)
+        manifest.push({
+          createdAt: new Date().toISOString(),
+          file,
+          prompt: item.prompt,
+          promptIndex: item.promptIndex,
+          model: options.model,
+          size: options.size,
+          seed: options.seed,
+          negativePrompt: options.negativePrompt,
+          promptExtend: options.promptExtend,
+          watermark: options.watermark,
+          requestId: item.requestId,
+          width: entry.width,
+          height: entry.height,
+          bytes: entry.bytes,
+          mediaType: entry.mediaType,
+        })
       }
-      return { model: options.model, images: saved, ...rewriteStatus === undefined ? {} : { rewriteStatus } }
+      if (saved.length === 0) {
+        throw new QwenImageError('no image could be saved: every download failed', 'QWEN_IMAGE_DOWNLOAD_FAILED')
+      }
+
+      const manifestPath = join(directory, MANIFEST_FILE)
+      try {
+        await appendFile(manifestPath, manifest.map((line) => JSON.stringify(line)).join(String.fromCharCode(10)) + String.fromCharCode(10))
+      } catch (error) {
+        warnings.push('the generation manifest could not be written: ' + (error?.message ?? String(error)))
+      }
+      return {
+        model: options.model,
+        images: saved,
+        manifestPath,
+        ...warnings.length === 0 ? {} : { warnings },
+        ...rewriteStatus === undefined ? {} : { rewriteStatus },
+      }
     },
     presentCall(args) {
       const input = args !== null && typeof args === 'object' ? args : {}
@@ -958,7 +1220,7 @@ export function apply(ctx, rawConfig) {
         title: `Generate image (${typeof input.model === 'string' ? input.model : config.defaultModel})`,
         kind: 'other',
         rawInput: {
-          prompt: typeof input.prompt === 'string' ? input.prompt : undefined,
+          prompt: typeof input.prompt === 'string' ? input.prompt : Array.isArray(input.prompts) ? input.prompts.join(' / ') : undefined,
           size: typeof input.size === 'string' ? input.size : config.defaultSize,
         },
       }

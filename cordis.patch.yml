@@ -11,7 +11,10 @@
         baseUrl: https://token-plan.maas.qianwenaiapi.com/api/v1/services/aigc/multimodal-generation/generation
         defaultModel: wan2.7-image-pro
         defaultSize: 1024*1024
-        timeoutMs: 180000
+        # Keep this under the host's default 120 s per-call timeout: a synchronous
+        # image call has no task id to resume, so a budget the host outlives
+        # loses a paid result.
+        timeoutMs: 110000
         # Asynchronous video-synthesis endpoint. The task-query URL
         # (@ .../tasks/{task_id}) is derived from this path, so keep the whole
         # /services/aigc/video-generation/video-synthesis suffix.

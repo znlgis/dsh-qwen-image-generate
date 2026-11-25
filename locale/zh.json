@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "千问生图与视频",
-    "description": "提供 qwen_image_generate 与 qwen_video_generate 两个工具：前者用千问 Token Plan 的生图模型（wan2.7-image-pro、qwen-image-3.0-pro 等）按文字描述生成图片，后者用视频模型（wan3.0-video 等）提交异步任务并把成片下载为 MP4，两者都保存到当前会话的工作目录。API Key 从名为 QWEN_TOKEN_PLAN_API_KEY 的凭据中读取；生成时会把提示词与输入素材发送到千问 Token Plan 接口并计入套餐用量。关闭该插件后工具即消失。"
+    "description": "提供 qwen_image_generate 与 qwen_video_generate 两个工具：前者用千问 Token Plan 的生图模型（wan2.7-image-pro、qwen-image-3.0-pro 等）按文字描述生成图片，后者用视频模型（wan3.0-video 等）提交异步任务并把成片下载为 MP4，两者都保存到当前会话的工作目录。API Key 从名为 DASHSCOPE_API_KEY 的凭据中读取；生成时会把提示词与输入素材发送到千问 Token Plan 接口并计入套餐用量。关闭该插件后工具即消失。"
   }
 }

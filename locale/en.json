@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Qwen image and video generation",
-    "description": "Adds the qwen_image_generate and qwen_video_generate tools: the first draws images with the Qwen Token Plan image models (wan2.7-image-pro, qwen-image-3.0-pro and others), the second submits asynchronous video tasks to the video models (wan3.0-video and others) and downloads the finished MP4. Both save into the session workspace. The API key is read from the QWEN_TOKEN_PLAN_API_KEY credential; generation sends the prompt and input media to the Qwen Token Plan endpoint and counts against that plan. Turning the plugin off removes the tools."
+    "description": "Adds the qwen_image_generate and qwen_video_generate tools: the first draws images with the Qwen Token Plan image models (wan2.7-image-pro, qwen-image-3.0-pro and others), the second submits asynchronous video tasks to the video models (wan3.0-video and others) and downloads the finished MP4. Both save into the session workspace. The API key is read from the DASHSCOPE_API_KEY credential; generation sends the prompt and input media to the Qwen Token Plan endpoint and counts against that plan. Turning the plugin off removes the tools."
   }
 }

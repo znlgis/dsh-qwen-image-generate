@@ -13,7 +13,14 @@
 
 - 模型：`wan2.7-image-pro`（默认）、`wan2.7-image`、`qwen-image-3.0-pro`、`qwen-image-2.0-pro`、`qwen-image-2.0`
 - 尺寸：`宽*高`，例如 `1024*1024`（默认）、`1536*1024`、`720*1280`
-- 一次最多 6 张（`count`）；服务不支持批量字段时自动退回逐张请求；传入 `image_urls` 可让支持图生图的模型改图
+- 一次最多 6 张：`count` 重画同一提示词，`prompts` 一次画一组不同主体（1~6 条，每条一张图，`count` 对每条生效，
+  `prompts.length × count` 不能超过 6）。系列图用 `prompts` 一次出完，不要用多次调用拼
+- `name_prefix` 指定文件名：字符串给所有文件加前缀（`cat` → `cat_01.png`），数组按顺序逐个命名且数量必须与图片数一致；
+  默认仍是 `qwen_<时间戳>_<序号>.png`
+- 服务不支持批量字段（`n`）时自动退回逐张请求，并保留已成功的图片：失败的那张写进 `warnings`，整批不会因为一张失败被丢弃
+- `negative_prompt` 只对 `qwen-image-3.0` 系列生效；其他模型不会发送该参数，结果里会给出 `warnings` 提示
+- 每次调用会把提示词、模型、尺寸、seed 等写进输出目录的 `.manifest.jsonl`，返回的 `manifestPath` 指向它；重复出图/复现时先看这里
+- 传入 `image_urls` 可让支持图生图的模型改图
 
 ### 视频
 
@@ -60,7 +67,7 @@
 | `baseUrl` | `.../services/aigc/multimodal-generation/generation` | 图像生成接口 |
 | `defaultModel` | `wan2.7-image-pro` | 生图未指定模型时使用 |
 | `defaultSize` | `1024*1024` | 生图未指定尺寸时使用 |
-| `timeoutMs` | `180000` | 单次生图请求与下载的预算 |
+| `timeoutMs` | `110000` | 单次生图请求与下载的预算，刻意压在宿主 120 秒工具超时之下 |
 | `videoBaseUrl` | `.../services/aigc/video-generation/video-synthesis` | 视频提交接口；任务查询地址由它派生 |
 | `defaultVideoModel` | `wan3.0-video` | 视频未指定模型时使用 |
 | `defaultVideoResolution` | `720P` | 视频未指定分辨率时使用 |
@@ -75,6 +82,8 @@
 
 - 生成会把提示词（以及图生图/参考生视频时的输入素材）发送到千问 Token Plan 接口，按套餐用量计费；视频消耗高于图片。
 - `output_dir` 只能指向会话工作区内，越界路径会被拒绝；配置项 `outputDir` 是运维配置，不受这条限制。
+- 单次生图调用默认预算 `timeoutMs` 为 110 秒，刻意压在宿主默认 120 秒的每次工具调用超时之下：生图是同步接口，没有 task id 可续查，
+  预算一旦超过宿主限制，过程会被宿主杀掉而图已计费。批量时按单张十几到几十秒估算，宁可分两次调用。
 - 已提交但没等到结果的视频任务记在输出目录的 `.pending-tasks.json`，任务完成或明确失败后自动移除。
 - 接口返回的图片/视频链接有时效，插件会立即下载到本地，因此不依赖该链接。
 - 图片只有在当前模型声明支持图片输入时才作为图片块进入对话；纯文本模型只会收到文件路径。视频只返回本地路径。

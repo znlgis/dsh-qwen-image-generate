@@ -30,6 +30,7 @@ const calls = []
 let taskOnePolls = 0
 let rejectBatchField = false
 let singleImageSerial = 0
+let transientFailuresLeft = 0
 const json = (value) => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } })
 const failure = (status, value) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 
@@ -56,6 +57,10 @@ globalThis.fetch = async (url, init) => {
   if (target.startsWith('https://token-plan')) {
     const body = JSON.parse(String(init?.body))
     const prompt = body.input?.messages?.[0]?.content?.find((part) => typeof part.text === 'string')?.text ?? ''
+    if (transientFailuresLeft > 0) {
+      transientFailuresLeft -= 1
+      return failure(503, { code: 'ServiceUnavailable', message: 'service is busy' })
+    }
     if (prompt === 'unauthorized') {
       return failure(401, { code: 'InvalidApiKey', message: 'invalid api key', request_id: 'req-401' })
     }
@@ -292,6 +297,70 @@ rejectBatchField = false
 const ledger = JSON.parse(await readFile(join(dir, 'qwen-videos', '.pending-tasks.json'), 'utf8'))
 expect('pending task is written to the ledger', Object.hasOwn(ledger, 'task-pending'), true)
 expect('finished task leaves the ledger', Object.hasOwn(ledger, 'task-1'), false)
+
+// --- image tool: several prompts in one call ------------------------------
+calls.length = 0
+const seriesValue = await registered.qwen_image_generate.execute({
+  prompts: ['a rat holding coins', 'an ox in shallow water'],
+  name_prefix: ['01_rat', '02_ox'],
+}, exec)
+const seriesCalls = calls.filter((call) => String(call.url).includes('/multimodal-generation'))
+expect('one request per prompt', seriesCalls.length, 2)
+expect('series returns both images', seriesValue.images.length, 2)
+expect('series names follow the prefix array', [
+  seriesValue.images[0].path.endsWith('01_rat.png'),
+  seriesValue.images[1].path.endsWith('02_ox.png'),
+], [true, true])
+expect('series reports the prompt index', seriesValue.images.map((image) => image.promptIndex), [0, 1])
+
+// --- image tool: a single name prefix numbers the files -------------------
+calls.length = 0
+rejectBatchField = true
+singleImageSerial = 0
+const prefixed = await registered.qwen_image_generate.execute({ prompt: 'a white horse', count: 2, name_prefix: 'horse' }, exec)
+expect('single prefix numbers the files', [
+  prefixed.images[0].path.endsWith('horse_01.png'),
+  prefixed.images[1].path.endsWith('horse_02.png'),
+], [true, true])
+rejectBatchField = false
+
+// --- image tool: manifest ledger -----------------------------------------
+const manifestLines = (await readFile(join(dir, 'qwen-images', '.manifest.jsonl'), 'utf8'))
+  .trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line))
+const manifestHit = manifestLines.find((line) => line.file === seriesValue.images[0].path)
+expect('manifest records the prompt', manifestHit.prompt, 'a rat holding coins')
+expect('manifest records the model', manifestHit.model, 'wan2.7-image-pro')
+expect('manifest path is returned', seriesValue.manifestPath, join(dir, 'qwen-images', '.manifest.jsonl'))
+
+// --- image tool: negative_prompt on a model that ignores it ---------------
+calls.length = 0
+const ignoredNegative = await registered.qwen_image_generate.execute({ prompt: 'a grey cat', negative_prompt: 'blur' }, exec)
+expect('negative_prompt is reported as ignored', Array.isArray(ignoredNegative.warnings) && ignoredNegative.warnings.some((warning) => warning.includes('negative_prompt was not sent')), true)
+const ignoredRequest = JSON.parse(String(calls.filter((call) => String(call.url).includes('/multimodal-generation')).pop().init.body))
+expect('negative_prompt is not sent to wan', ignoredRequest.parameters.negative_prompt, undefined)
+const ignoredBlocks = registered.qwen_image_generate.output.render({}, ignoredNegative)
+expect('warnings reach the rendered text', ignoredBlocks.some((block) => String(block.text).includes('negative_prompt was not sent')), true)
+
+// --- image tool: batch budget and argument validation ---------------------
+const budgetRejected = async (args) => {
+  try {
+    await registered.qwen_image_generate.execute(args, exec)
+    return undefined
+  } catch (error) {
+    return error?.code
+  }
+}
+expect('prompts times count stays within one call', await budgetRejected({ prompts: ['a', 'b', 'c', 'd'], count: 2 }), 'INVALID_ARGS')
+expect('prompt and prompts are exclusive', await budgetRejected({ prompt: 'a cat', prompts: ['a dog'] }), 'INVALID_ARGS')
+expect('prefix array must cover every image', await budgetRejected({ prompts: ['a cat', 'a dog'], name_prefix: ['only-one'] }), 'INVALID_ARGS')
+
+// --- image tool: retryable failures are retried ---------------------------
+calls.length = 0
+transientFailuresLeft = 1
+const retried = await registered.qwen_image_generate.execute({ prompt: 'a green frog' }, exec)
+expect('transient failure is retried', calls.filter((call) => String(call.url).includes('/multimodal-generation')).length, 2)
+expect('retry still returns the image', retried.images.length, 1)
+transientFailuresLeft = 0
 
 await rm(dir, { recursive: true, force: true })
 if (failures.length > 0) {
