@@ -28,7 +28,10 @@ const IMAGE_BODY = {
 
 const calls = []
 let taskOnePolls = 0
+let rejectBatchField = false
+let singleImageSerial = 0
 const json = (value) => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } })
+const failure = (status, value) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
 
 globalThis.fetch = async (url, init) => {
   const target = String(url)
@@ -50,7 +53,27 @@ globalThis.fetch = async (url, init) => {
   if (target === 'https://cdn.example/v.mp4') {
     return new Response(MP4, { status: 200, headers: { 'content-type': 'video/mp4' } })
   }
-  if (target.startsWith('https://token-plan')) return json(IMAGE_BODY)
+  if (target.startsWith('https://token-plan')) {
+    const body = JSON.parse(String(init?.body))
+    const prompt = body.input?.messages?.[0]?.content?.find((part) => typeof part.text === 'string')?.text ?? ''
+    if (prompt === 'unauthorized') {
+      return failure(401, { code: 'InvalidApiKey', message: 'invalid api key', request_id: 'req-401' })
+    }
+    if (rejectBatchField && body.parameters?.n !== undefined) {
+      return failure(400, { code: 'InvalidParameter', message: 'n is not supported by this model', request_id: 'req-400' })
+    }
+    if (rejectBatchField) {
+      singleImageSerial += 1
+      return json({
+        ...IMAGE_BODY,
+        output: {
+          ...IMAGE_BODY.output,
+          choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: [{ image: 'https://cdn.example/single-' + singleImageSerial + '.png' }] } }],
+        },
+      })
+    }
+    return json(IMAGE_BODY)
+  }
   return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } })
 }
 
@@ -226,6 +249,49 @@ try {
   rejected = error?.code
 }
 expect('empty request rejected', rejected, 'INVALID_ARGS')
+
+// --- output_dir stays inside the workspace --------------------------------
+let escaped = undefined
+try {
+  await registered.qwen_image_generate.execute({ prompt: 'a red bicycle', output_dir: '../escape' }, exec)
+} catch (error) {
+  escaped = error?.code
+}
+expect('output_dir outside the workspace rejected', escaped, 'INVALID_ARGS')
+
+// --- provider request id reaches the failure message ----------------------
+let unauthorized = ''
+try {
+  await registered.qwen_image_generate.execute({ prompt: 'unauthorized' }, exec)
+} catch (error) {
+  unauthorized = error?.message ?? ''
+}
+expect('failure carries the provider request id', unauthorized.includes('req-401'), true)
+
+// --- concurrent images never share a file name ----------------------------
+const [firstImage, secondImage] = await Promise.all([
+  registered.qwen_image_generate.execute({ prompt: 'a blue bus' }, exec),
+  registered.qwen_image_generate.execute({ prompt: 'a blue bus' }, exec),
+])
+expect('concurrent images get distinct files', firstImage.images[0].path !== secondImage.images[0].path, true)
+
+// --- count above 1 falls back to single requests --------------------------
+calls.length = 0
+rejectBatchField = true
+singleImageSerial = 0
+const batchValue = await registered.qwen_image_generate.execute({ prompt: 'three lanterns', count: 3 }, exec)
+const batchParams = calls
+  .filter((call) => call.url.includes('/multimodal-generation'))
+  .map((call) => JSON.parse(String(call.init.body)).parameters)
+expect('batch fallback counts the rejected attempt', batchParams.length, 4)
+expect('batch fallback drops the n field', batchParams.slice(1).every((parameters) => parameters.n === undefined), true)
+expect('batch fallback keeps every image', batchValue.images.length, 3)
+rejectBatchField = false
+
+// --- pending tasks are ledgered, finished ones removed --------------------
+const ledger = JSON.parse(await readFile(join(dir, 'qwen-videos', '.pending-tasks.json'), 'utf8'))
+expect('pending task is written to the ledger', Object.hasOwn(ledger, 'task-pending'), true)
+expect('finished task leaves the ledger', Object.hasOwn(ledger, 'task-1'), false)
 
 await rm(dir, { recursive: true, force: true })
 if (failures.length > 0) {

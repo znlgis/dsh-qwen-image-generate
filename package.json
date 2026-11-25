@@ -1,6 +1,6 @@
 {
   "name": "@dsh-gis/dsh-qwen-image-generate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "MIT",
   "description": "Generate images and videos with the Qwen Token Plan models (wan2.7-image-pro, wan3.0-video, ...) and save them into the session workspace.",
   "type": "module",
@@ -9,7 +9,10 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
+  "files": ["index.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "_offline-test.mjs"],
+  "scripts": {
+    "test": "node _offline-test.mjs"
+  },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" }
   },

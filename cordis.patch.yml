@@ -22,4 +22,7 @@
         defaultVideoDuration: 5
         videoTimeoutMs: 180000
         videoPollIntervalMs: 5000
-        videoWaitMs: 300000
+        # Keep this under the host's default 120 s per-call timeout: a longer
+        # poll window leaves the task running (and billed) while the process is
+        # killed mid-poll, losing the task id.
+        videoWaitMs: 90000

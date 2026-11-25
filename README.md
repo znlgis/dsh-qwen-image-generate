@@ -13,7 +13,7 @@
 
 - 模型：`wan2.7-image-pro`（默认）、`wan2.7-image`、`qwen-image-3.0-pro`、`qwen-image-2.0-pro`、`qwen-image-2.0`
 - 尺寸：`宽*高`，例如 `1024*1024`（默认）、`1536*1024`、`720*1280`
-- 一次最多 6 张（`count`）；传入 `image_urls` 可让支持图生图的模型改图
+- 一次最多 6 张（`count`）；服务不支持批量字段时自动退回逐张请求；传入 `image_urls` 可让支持图生图的模型改图
 
 ### 视频
 
@@ -29,19 +29,24 @@
   传 `file`/`link` 时服务要求开启提示词改写，插件会自动带上 `prompt_extend: true`。
 - 其余可选参数：`audio`（是否带音轨）、`watermark`、`seed`、`prompt_extend`
 
-视频是异步任务：这次调用最多等 `wait_seconds`（默认 300 秒），还没渲染完就返回 `status: "pending"` 和
+视频是异步任务：这次调用最多等 `wait_seconds`（默认 90 秒），还没渲染完就返回 `status: "pending"` 和
 `task_id`；再用 `task_id` 调一次即可继续等待并下载。任务 id 的有效期是 24 小时。
+
+默认 90 秒是刻意压在宿主默认的单次工具超时（120 秒）之下：等待窗口一旦超过宿主超时，进程会在轮询途中被杀，
+任务已提交并计费，`task_id` 却跟着丢失。需要更长的单次等待就显式传 `wait_seconds`（上限 1800），并把宿主的
+工具超时一起调高。轮询途中被取消时会返回 `pending` 而不是抛错，已提交的任务也会记进输出目录的
+`.pending-tasks.json`，进程被杀后照着里面的 `taskId` 继续查即可。
 
 生成的文件保存在会话目录下的 `qwen-images/` 与 `qwen-videos/`，命名形如
 `qwen_20261125_140901_1.png`、`video_20261125_140901_1.mp4`。
-可用 `output_dir` 参数改到别的目录（相对路径按会话目录解析）。
+可用 `output_dir` 参数改到别的目录（相对路径按会话目录解析，且必须留在会话工作区内）。
 
 ## 配置 API Key
 
-插件不保存密钥本身，只保存**凭据名**。默认读取 `QWEN_TOKEN_PLAN_API_KEY`：
+插件不保存密钥本身，只保存**凭据名**。默认读取 `DASHSCOPE_API_KEY`（与本仓库 `cordis.patch.yml` 的取值一致）：
 
 1. 到千问 Token Plan 控制台获取以 `sk-sp-` 开头的 API Key（[接入概览](https://platform.qianwenai.com/docs/token-plan)）。
-2. 在 DSH 的模型与凭据设置里保存为 `QWEN_TOKEN_PLAN_API_KEY`；或在启动 DSH 前 `export QWEN_TOKEN_PLAN_API_KEY=sk-sp-...`。
+2. 在 DSH 的模型与凭据设置里保存为 `DASHSCOPE_API_KEY`；或在启动 DSH 前 `export DASHSCOPE_API_KEY=sk-sp-...`。
 
 凭据解析顺序由 DSH 凭据服务决定：存储的凭据 > 启动环境变量 > 项目 `.env` > harness home 的 `.env`。
 
@@ -63,12 +68,14 @@
 | `defaultVideoDuration` | `5` | 视频未指定时长（秒）时使用 |
 | `videoTimeoutMs` | `180000` | 单次提交/查询/下载请求的预算 |
 | `videoPollIntervalMs` | `5000` | 轮询间隔 |
-| `videoWaitMs` | `300000` | 单次工具调用默认等待时长，超时返回 task_id |
+| `videoWaitMs` | `90000` | 单次工具调用默认等待时长，超时返回 task_id；刻意压在宿主默认 120 秒超时之下 |
 | `outputDir` | 空（用会话目录） | 会话目录不可用时的兜底目录 |
 
 ## 说明与限制
 
 - 生成会把提示词（以及图生图/参考生视频时的输入素材）发送到千问 Token Plan 接口，按套餐用量计费；视频消耗高于图片。
+- `output_dir` 只能指向会话工作区内，越界路径会被拒绝；配置项 `outputDir` 是运维配置，不受这条限制。
+- 已提交但没等到结果的视频任务记在输出目录的 `.pending-tasks.json`，任务完成或明确失败后自动移除。
 - 接口返回的图片/视频链接有时效，插件会立即下载到本地，因此不依赖该链接。
 - 图片只有在当前模型声明支持图片输入时才作为图片块进入对话；纯文本模型只会收到文件路径。视频只返回本地路径。
 - 关闭插件后工具立即消失，已下载的文件保留在工作目录中。
