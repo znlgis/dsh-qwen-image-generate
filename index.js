@@ -1,18 +1,24 @@
 /**
- * Qwen Token Plan image generation for DeepSeek Harness.
+ * Qwen Token Plan image and video generation for DeepSeek Harness.
  *
- * Registers one model-facing tool, `qwen_image_generate`, that calls the Qwen
- * Token Plan multimodal-generation endpoint, downloads the generated PNG files
- * into the session workspace, and returns them both as local paths and (when the
- * active model route accepts images) as chat image blocks.
+ * Registers two model-facing tools: `qwen_image_generate` calls the
+ * multimodal-generation endpoint, downloads the generated PNG files into the
+ * session workspace, and returns them both as local paths and (when the active
+ * model route accepts images) as chat image blocks; `qwen_video_generate`
+ * submits an asynchronous video-synthesis task, polls it, and downloads the
+ * finished MP4 into the session workspace.
  *
  * Configuration arrives from the bundle patch row:
  * - `apiKeyEnv`  credential reference resolved through `ctx.credentials`, then
  *                the launch environment (default `QWEN_TOKEN_PLAN_API_KEY`)
  * - `baseUrl`    generation endpoint
- * - `defaultModel` / `defaultSize` tool defaults
+ * - `defaultModel` / `defaultSize` image tool defaults
+ * - `defaultVideoModel` / `defaultVideoResolution` / `defaultVideoRatio` /
+ *                `defaultVideoDuration` video tool defaults
+ * - `videoBaseUrl` asynchronous video-synthesis endpoint (task URL derived)
+ * - `videoTimeoutMs` / `videoPollIntervalMs` / `videoWaitMs` video budgets
  * - `outputDir`  directory used when the session directory is unavailable
- * - `timeoutMs`  per-request budget
+ * - `timeoutMs`  per-request image budget
  *
  * The plugin imports no Harness package at runtime: profile-installed bundles
  * resolve Harness packages through the loader, and staying dependency-free keeps
@@ -32,7 +38,15 @@ export const inject = ['tools']
 
 const DEFAULT_API_KEY_ENV = 'DASHSCOPE_API_KEY'
 const DEFAULT_BASE_URL = 'https://token-plan.maas.qianwenaiapi.com/api/v1/services/aigc/multimodal-generation/generation'
-const DEFAULT_MODEL = 'wan2.7-image'
+const DEFAULT_MODEL = 'wan2.7-image-pro'
+const DEFAULT_VIDEO_MODEL = 'wan3.0-video'
+const DEFAULT_VIDEO_BASE_URL = 'https://token-plan.maas.qianwenaiapi.com/api/v1/services/aigc/video-generation/video-synthesis'
+const DEFAULT_VIDEO_RESOLUTION = '720P'
+const DEFAULT_VIDEO_RATIO = '16:9'
+const DEFAULT_VIDEO_DURATION = 5
+const DEFAULT_VIDEO_TIMEOUT_MS = 180_000
+const DEFAULT_VIDEO_POLL_INTERVAL_MS = 5_000
+const DEFAULT_VIDEO_WAIT_MS = 300_000
 const DEFAULT_SIZE = '1024*1024'
 const DEFAULT_TIMEOUT_MS = 180_000
 
@@ -45,6 +59,35 @@ const KNOWN_MODELS = [
   'wan2.7-image-pro',
 ]
 
+/** Models documented for the Token Plan video endpoint (Wan 3.0 and HappyHorse). */
+const KNOWN_VIDEO_MODELS = [
+  'wan3.0-video',
+  'wan3.0-video-prime',
+  'happyhorse-1.1-t2v',
+  'happyhorse-1.1-i2v',
+  'happyhorse-1.1-r2v',
+]
+
+/** Resolution tiers shared by the documented video models. */
+const VIDEO_RESOLUTIONS = ['480P', '720P', '1080P']
+
+/** Aspect ratios across the documented video models; `adaptive` lets Wan choose. */
+const VIDEO_RATIOS = ['adaptive', '21:9', '16:9', '4:3', '1:1', '3:4', '9:16', '4:5', '5:4', '9:21']
+
+/** Media slot types understood by `wan3.0-video` input.media. */
+const VIDEO_MEDIA_TYPES = [
+  'first_frame',
+  'last_frame',
+  'reference_image',
+  'reference_video',
+  'reference_audio',
+  'file',
+  'link',
+]
+
+/** Path fragment that identifies the asynchronous video-synthesis endpoint. */
+const VIDEO_SUBMIT_SUFFIX = '/services/aigc/video-generation/video-synthesis'
+
 /** Resolved plugin configuration after defaults. */
 function resolveConfig(raw) {
   const config = raw !== null && typeof raw === 'object' ? raw : {}
@@ -55,6 +98,14 @@ function resolveConfig(raw) {
     baseUrl: text(config.baseUrl, DEFAULT_BASE_URL),
     defaultModel: text(config.defaultModel, DEFAULT_MODEL),
     defaultSize: text(config.defaultSize, DEFAULT_SIZE),
+    videoBaseUrl: text(config.videoBaseUrl, DEFAULT_VIDEO_BASE_URL),
+    defaultVideoModel: text(config.defaultVideoModel, DEFAULT_VIDEO_MODEL),
+    defaultVideoResolution: text(config.defaultVideoResolution, DEFAULT_VIDEO_RESOLUTION),
+    defaultVideoRatio: text(config.defaultVideoRatio, DEFAULT_VIDEO_RATIO),
+    defaultVideoDuration: positive(config.defaultVideoDuration, DEFAULT_VIDEO_DURATION),
+    videoTimeoutMs: positive(config.videoTimeoutMs, DEFAULT_VIDEO_TIMEOUT_MS),
+    videoPollIntervalMs: positive(config.videoPollIntervalMs, DEFAULT_VIDEO_POLL_INTERVAL_MS),
+    videoWaitMs: positive(config.videoWaitMs, DEFAULT_VIDEO_WAIT_MS),
     outputDir: text(config.outputDir, ''),
     timeoutMs: positive(config.timeoutMs, DEFAULT_TIMEOUT_MS),
   }
@@ -240,15 +291,15 @@ function stamp(date = new Date()) {
 
 /**
  * Pick the directory generated files land in: an explicit argument, then the
- * configured `outputDir`, then `qwen-images` under the session directory.
+ * configured `outputDir`, then `leaf` under the session directory.
  */
-async function outputDirectory(ctx, configured, requested, exec) {
+async function outputDirectory(ctx, configured, requested, exec, leaf) {
   const session = await sessionDirectory(ctx, exec)
   const resolveAgainstSession = (value) => (isAbsolute(value) ? value : resolvePath(session, value))
   const explicit = isNonBlankString(requested) ? requested.trim() : undefined
   if (explicit !== undefined) return resolveAgainstSession(explicit)
   const fallback = isNonBlankString(configured) ? configured.trim() : undefined
-  return fallback === undefined ? join(session, 'qwen-images') : resolveAgainstSession(fallback)
+  return fallback === undefined ? join(session, leaf) : resolveAgainstSession(fallback)
 }
 
 /** Resolve the session's working directory without failing the tool when absent. */
@@ -341,6 +392,229 @@ function parseArgs(args, config) {
   }
 }
 
+/** Derive the asynchronous task-query URL from the configured submit endpoint. */
+function videoTaskUrl(baseUrl, taskId) {
+  const at = baseUrl.indexOf(VIDEO_SUBMIT_SUFFIX)
+  if (at === -1) {
+    throw new QwenImageError(
+      'videoBaseUrl must end with ' + VIDEO_SUBMIT_SUFFIX + ' so the task query URL can be derived; fix the plugin config',
+      'QWEN_VIDEO_BAD_CONFIG',
+    )
+  }
+  return baseUrl.slice(0, at) + '/tasks/' + encodeURIComponent(taskId)
+}
+
+/** Read the task status out of a submission or query body. */
+function videoTaskStatus(body) {
+  const status = body?.output?.task_status
+  return isNonBlankString(status) ? status.trim().toUpperCase() : 'UNKNOWN'
+}
+
+/** One actionable sentence for a failed or cancelled video task. */
+function videoTaskFailure(body) {
+  const message = body?.output?.message ?? body?.message
+  const code = body?.output?.code ?? body?.code
+  const parts = []
+  if (isNonBlankString(code)) parts.push(String(code).trim())
+  if (isNonBlankString(message)) parts.push(String(message).trim())
+  return parts.length === 0 ? 'the service reported no reason' : parts.join(': ')
+}
+
+/** Parse one JSON response body or fail with a stable code. */
+function parseJsonBody(text, what) {
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new QwenImageError(what + ' response was not JSON: ' + text.trim().slice(0, 200), 'QWEN_VIDEO_BAD_RESPONSE')
+  }
+}
+
+/** Submit one asynchronous video task and return its identifier. */
+async function submitVideoTask(options) {
+  const { baseUrl, apiKey, model, input, parameters, signal } = options
+  let response
+  try {
+    response = await fetch(baseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey,
+        'X-DashScope-Async': 'enable',
+      },
+      body: JSON.stringify({ model, input, parameters }),
+      signal,
+    })
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error
+    throw new QwenImageError('the video request failed before a response: ' + (error?.message ?? String(error)), 'QWEN_VIDEO_NETWORK')
+  }
+  const text = await response.text()
+  if (!response.ok) {
+    const hint = response.status === 401 || response.status === 403
+      ? ' — the API key is missing, expired, or not authorized for this model'
+      : response.status === 429
+        ? ' — the plan rate limit was reached; retry later'
+        : response.status === 400
+          ? ' — the model, prompt, media, or parameters were rejected'
+          : ''
+    throw new QwenImageError('the video request was refused: ' + providerMessage(text, response.status) + hint, 'QWEN_VIDEO_REQUEST_FAILED')
+  }
+  const body = parseJsonBody(text, 'the video submission')
+  const taskId = body?.output?.task_id
+  if (!isNonBlankString(taskId)) {
+    throw new QwenImageError('the service accepted the video request without a task id', 'QWEN_VIDEO_BAD_RESPONSE')
+  }
+  return String(taskId).trim()
+}
+
+/** Query one asynchronous video task and return its parsed body. */
+async function queryVideoTask(url, apiKey, signal) {
+  let response
+  try {
+    response = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey }, signal })
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error
+    throw new QwenImageError('querying the video task failed before a response: ' + (error?.message ?? String(error)), 'QWEN_VIDEO_NETWORK')
+  }
+  const text = await response.text()
+  if (!response.ok) {
+    throw new QwenImageError('querying the video task was refused: ' + providerMessage(text, response.status), 'QWEN_VIDEO_QUERY_FAILED')
+  }
+  return parseJsonBody(text, 'the video task')
+}
+
+/** Extract the produced video URL from a finished task body. */
+function videoSourceOf(body) {
+  const output = body?.output ?? {}
+  if (isNonBlankString(output.video_url)) return output.video_url.trim()
+  const results = output.video_results
+  if (Array.isArray(results)) {
+    for (const entry of results) {
+      if (isNonBlankString(entry?.url)) return entry.url.trim()
+    }
+  }
+  return undefined
+}
+
+/** Identify a supported video container from its signature bytes. */
+function sniffVideoType(data) {
+  const at = (offset, bytes) => bytes.every((byte, index) => data[offset + index] === byte)
+  if (data.byteLength >= 12 && at(4, [0x66, 0x74, 0x79, 0x70])) return 'video/mp4'
+  if (at(0, [0x1a, 0x45, 0xdf, 0xa3])) return 'video/webm'
+  return undefined
+}
+
+/** File extension for one accepted video media type. */
+function videoExtensionOf(mediaType) {
+  return mediaType === 'video/webm' ? '.webm' : '.mp4'
+}
+
+/** Download one produced video into bytes plus its media type. */
+async function downloadVideo(url, signal) {
+  const response = await fetch(url, { signal })
+  if (!response.ok) {
+    throw new QwenImageError('downloading the generated video failed with HTTP ' + response.status, 'QWEN_VIDEO_DOWNLOAD_FAILED')
+  }
+  const data = new Uint8Array(await response.arrayBuffer())
+  if (data.byteLength === 0) {
+    throw new QwenImageError('the downloaded video was empty', 'QWEN_VIDEO_DOWNLOAD_FAILED')
+  }
+  const header = (response.headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? ''
+  const mediaType = header.startsWith('video/') ? header : sniffVideoType(data) ?? 'video/mp4'
+  return { data, mediaType }
+}
+
+/** Sleep for a poll interval while honouring cancellation. */
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('aborted'))
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal.reason ?? new Error('aborted'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/** Combine the caller's cancellation with one request budget. */
+function requestSignal(exec, budgetMs) {
+  return combineSignals(exec.signal, AbortSignal.timeout(budgetMs))
+}
+
+/** Validate and normalize the model-supplied video arguments. */
+function parseVideoArgs(args, config) {
+  if (args === null || typeof args !== 'object') throw new ImageArgsError('arguments must be an object')
+  const taskId = isNonBlankString(args.task_id) ? args.task_id.trim() : undefined
+  const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
+  const rawMedia = args.media
+  let media
+  if (rawMedia !== undefined) {
+    if (!Array.isArray(rawMedia) || rawMedia.length === 0 || rawMedia.length > 8) {
+      throw new ImageArgsError('media must be an array of 1 to 8 { type, url } entries')
+    }
+    media = rawMedia.map((entry) => {
+      if (entry === null || typeof entry !== 'object') {
+        throw new ImageArgsError('every media entry must be an object with type and url')
+      }
+      if (!VIDEO_MEDIA_TYPES.includes(entry.type)) {
+        throw new ImageArgsError('media type "' + String(entry.type) + '" must be one of ' + VIDEO_MEDIA_TYPES.join(', '))
+      }
+      if (!isNonBlankString(entry.url)) throw new ImageArgsError('every media entry needs a non-empty url')
+      return { type: entry.type, url: entry.url.trim() }
+    })
+  }
+  if (taskId === undefined && prompt === '' && media === undefined) {
+    throw new ImageArgsError('pass a prompt, at least one media entry, or a task_id to continue polling a submitted task')
+  }
+
+  const model = isNonBlankString(args.model) ? args.model.trim() : config.defaultVideoModel
+  if (!KNOWN_VIDEO_MODELS.includes(model)) {
+    throw new ImageArgsError('model "' + model + '" is not a Token Plan video model; use one of ' + KNOWN_VIDEO_MODELS.join(', '))
+  }
+  const resolution = isNonBlankString(args.resolution) ? args.resolution.trim().toUpperCase() : config.defaultVideoResolution
+  if (!VIDEO_RESOLUTIONS.includes(resolution)) {
+    throw new ImageArgsError('resolution "' + resolution + '" must be one of ' + VIDEO_RESOLUTIONS.join(', '))
+  }
+  const ratio = isNonBlankString(args.ratio) ? args.ratio.trim() : config.defaultVideoRatio
+  if (!VIDEO_RATIOS.includes(ratio)) {
+    throw new ImageArgsError('ratio "' + ratio + '" must be one of ' + VIDEO_RATIOS.join(', '))
+  }
+  const duration = args.duration === undefined ? config.defaultVideoDuration : args.duration
+  if (!Number.isInteger(duration) || (duration !== -1 && (duration < 2 || duration > 30))) {
+    throw new ImageArgsError('duration must be -1 (model decides) or an integer from 2 to 30 seconds')
+  }
+  const seed = args.seed
+  if (seed !== undefined && (!Number.isInteger(seed) || seed < -1 || seed > 2_147_483_647)) {
+    throw new ImageArgsError('seed must be -1 or an integer from 0 to 2147483647')
+  }
+  const waitSeconds = args.wait_seconds === undefined ? Math.floor(config.videoWaitMs / 1000) : args.wait_seconds
+  if (!Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > 1800) {
+    throw new ImageArgsError('wait_seconds must be an integer from 1 to 1800')
+  }
+  return {
+    taskId,
+    prompt,
+    media,
+    model,
+    resolution,
+    ratio,
+    ratioGiven: isNonBlankString(args.ratio),
+    duration,
+    seed,
+    waitSeconds,
+    audio: typeof args.audio === 'boolean' ? args.audio : undefined,
+    watermark: typeof args.watermark === 'boolean' ? args.watermark : undefined,
+    promptExtend: typeof args.prompt_extend === 'boolean' ? args.prompt_extend : undefined,
+  }
+}
+
 /** Register the `qwen_image_generate` tool. */
 export function apply(ctx, rawConfig) {
   const config = resolveConfig(rawConfig)
@@ -348,7 +622,7 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register({
     name: 'qwen_image_generate',
     description: 'Generate images from a text prompt with the Qwen Token Plan image models '
-      + '(qwen-image-3.0-pro, wan2.7-image, ...), save them to the session workspace, and return their paths. '
+      + '(wan2.7-image-pro by default, plus qwen-image-3.0-pro and others), save them to the session workspace, and return their paths. '
       + 'Pass image_urls to edit existing images with an image-capable model. Generation takes tens of seconds.',
     parameters: {
       type: 'object',
@@ -456,7 +730,7 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const options = parseArgs(args, config)
       const apiKey = await resolveApiKey(ctx, config.apiKeyEnv)
-      const directory = await outputDirectory(ctx, config.outputDir, args.output_dir, exec)
+      const directory = await outputDirectory(ctx, config.outputDir, args.output_dir, exec, 'qwen-images')
       const acceptsImages = await routeAcceptsImages(ctx, exec)
       const attachments = ctx.get('attachments')
 
@@ -526,6 +800,236 @@ export function apply(ctx, rawConfig) {
         rawInput: {
           prompt: typeof input.prompt === 'string' ? input.prompt : undefined,
           size: typeof input.size === 'string' ? input.size : config.defaultSize,
+        },
+      }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'qwen_video_generate',
+    description: 'Generate a short video from a text prompt (and optionally first-frame, last-frame, or reference media) '
+      + 'with the Qwen Token Plan video models (wan3.0-video by default). Submission is asynchronous: this call polls for '
+      + 'up to wait_seconds and returns status "pending" with a task_id when the render is still running — call it again '
+      + 'with that task_id to keep waiting and download the finished MP4. Rendering usually takes between one and several minutes.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'What should happen in the video, as a full shot description. Required unless media or task_id is given.',
+        },
+        model: {
+          type: 'string',
+          enum: KNOWN_VIDEO_MODELS,
+          description: 'Video model id. wan3.0-video handles text, first/last frame, and all-reference input; '
+            + 'happyhorse-1.1-t2v/i2v/r2v are text, first-frame, and reference specializations. Defaults to "' + config.defaultVideoModel + '".',
+        },
+        resolution: {
+          type: 'string',
+          enum: VIDEO_RESOLUTIONS,
+          description: 'Resolution tier. Defaults to "' + config.defaultVideoResolution + '".',
+        },
+        ratio: {
+          type: 'string',
+          enum: VIDEO_RATIOS,
+          description: 'Aspect ratio; "adaptive" lets wan3.0-video follow the input media. Defaults to "' + config.defaultVideoRatio + '".',
+        },
+        duration: {
+          type: 'integer',
+          description: 'Length in seconds: -1 (model decides) or 2 through 30. Defaults to ' + config.defaultVideoDuration + '.',
+        },
+        audio: {
+          type: 'boolean',
+          description: 'Whether the output carries an audio track, for models that support sound. Defaults to the service setting.',
+        },
+        watermark: {
+          type: 'boolean',
+          description: 'Add the model watermark. Defaults to the service setting.',
+        },
+        seed: {
+          type: 'integer',
+          description: 'Random seed: -1 or 0 through 2147483647.',
+        },
+        prompt_extend: {
+          type: 'boolean',
+          description: 'Let the service rewrite the prompt before rendering. Defaults to the service setting.',
+        },
+        media: {
+          type: 'array',
+          description: 'Input media slots. first_frame/last_frame cannot be mixed with reference_* or file/link; '
+            + 'reference_image/reference_video/reference_audio combine freely. Order defines "image 1"/"video 1" in the prompt.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['type', 'url'],
+            properties: {
+              type: { type: 'string', enum: VIDEO_MEDIA_TYPES },
+              url: { type: 'string', description: 'Public HTTP(S) URL, oss:// temporary URL, or data:{MIME};base64,... payload.' },
+            },
+          },
+        },
+        task_id: {
+          type: 'string',
+          description: 'Continue waiting for an already submitted task instead of submitting a new one.',
+        },
+        wait_seconds: {
+          type: 'integer',
+          description: 'How long this call keeps polling before returning a pending task id. Defaults to '
+            + Math.floor(config.videoWaitMs / 1000) + ' seconds.',
+        },
+        output_dir: {
+          type: 'string',
+          description: 'Directory for the saved file; relative paths resolve against the session directory. Defaults to qwen-videos under it.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['model', 'taskId', 'status'],
+        properties: {
+          model: { type: 'string', description: 'Model that produced (or is producing) the video.' },
+          taskId: { type: 'string', description: 'Task id; pass it back to keep polling a pending task.' },
+          status: { type: 'string', enum: ['succeeded', 'pending'], description: 'Whether the MP4 is downloaded or still rendering.' },
+          video: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['path'],
+            properties: {
+              path: { type: 'string', description: 'Saved MP4 path in the workspace.' },
+              bytes: { type: 'integer', description: 'Saved byte size.' },
+              mediaType: { type: 'string', description: 'Saved video media type.' },
+              durationSeconds: { type: 'integer', description: 'Video length reported by the service, in seconds.' },
+              ratio: { type: 'string', description: 'Aspect ratio reported by the service.' },
+            },
+          },
+          message: { type: 'string', description: 'Why the call returned without a file, when it did.' },
+        },
+      },
+      render: (_args, value) => {
+        if (value.status === 'pending') {
+          return [{
+            type: 'text',
+            text: '<videoTask model="' + value.model + '" taskId="' + value.taskId + '" status="pending">\n'
+              + (value.message ?? 'The video is still rendering.') + '\n'
+              + 'Call qwen_video_generate again with task_id "' + value.taskId + '" to keep waiting and download the finished MP4.\n'
+              + '</videoTask>',
+          }]
+        }
+        const video = value.video
+        const details = [
+          video.bytes === undefined ? '' : video.bytes + ' bytes',
+          video.mediaType ?? '',
+          video.durationSeconds === undefined ? '' : video.durationSeconds + 's',
+          video.ratio ?? '',
+        ].filter((entry) => entry !== '').join(', ')
+        return [{
+          type: 'text',
+          text: '<generatedVideo model="' + value.model + '" taskId="' + value.taskId + '">\n'
+            + '1. ' + video.path + (details === '' ? '' : ' (' + details + ')') + '\n'
+            + '</generatedVideo>',
+        }]
+      },
+      presentationMeta: (_args, value) => (value.video === undefined
+        ? { taskId: value.taskId }
+        : { paths: [value.video.path] }),
+    },
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const options = parseVideoArgs(args, config)
+      const apiKey = await resolveApiKey(ctx, config.apiKeyEnv)
+      const directory = await outputDirectory(ctx, config.outputDir, args.output_dir, exec, 'qwen-videos')
+
+      let taskId = options.taskId
+      if (taskId === undefined) {
+        const input = {}
+        if (options.prompt !== '') input.prompt = options.prompt
+        if (options.media !== undefined) input.media = options.media
+        const parameters = {
+          resolution: options.resolution,
+          duration: options.duration,
+        }
+        // Wan 3.0 owns adaptive ratios and audio tracks; HappyHorse derives the
+        // ratio from its first frame and rejects these parameters. A first/last
+        // frame request keeps the frame's own shape unless a ratio was asked for.
+        const followsFrame = options.media !== undefined
+          && options.media.some((entry) => entry.type === 'first_frame' || entry.type === 'last_frame')
+        if (options.ratioGiven || options.model.startsWith('wan3.0')) {
+          parameters.ratio = followsFrame && !options.ratioGiven ? 'adaptive' : options.ratio
+        }
+        if (options.audio !== undefined && options.model.startsWith('wan3.0')) parameters.audio = options.audio
+        if (options.seed !== undefined) parameters.seed = options.seed
+        if (options.watermark !== undefined) parameters.watermark = options.watermark
+        // The service requires prompt rewriting when a document or web page is
+        // attached, so a file/link slot forces it on unless already requested.
+        const needsExtend = options.media !== undefined
+          && options.media.some((entry) => entry.type === 'file' || entry.type === 'link')
+        if (options.promptExtend !== undefined) parameters.prompt_extend = options.promptExtend
+        else if (needsExtend) parameters.prompt_extend = true
+
+        taskId = await submitVideoTask({
+          baseUrl: config.videoBaseUrl,
+          apiKey,
+          model: options.model,
+          input,
+          parameters,
+          signal: requestSignal(exec, config.videoTimeoutMs),
+        })
+      }
+
+      const taskUrl = videoTaskUrl(config.videoBaseUrl, taskId)
+      const deadline = Date.now() + options.waitSeconds * 1000
+      let body
+      let status
+      for (;;) {
+        body = await queryVideoTask(taskUrl, apiKey, requestSignal(exec, config.videoTimeoutMs))
+        status = videoTaskStatus(body)
+        if (status === 'SUCCEEDED') break
+        if (status === 'FAILED' || status === 'CANCELED' || status === 'UNKNOWN') {
+          throw new QwenImageError(
+            'video task ' + taskId + ' ended as ' + status + ': ' + videoTaskFailure(body),
+            'QWEN_VIDEO_TASK_FAILED',
+          )
+        }
+        if (Date.now() + config.videoPollIntervalMs > deadline) {
+          return {
+            model: options.model,
+            taskId,
+            status: 'pending',
+            message: 'The task is still ' + status + ' after ' + options.waitSeconds + ' seconds of polling.',
+          }
+        }
+        await sleep(config.videoPollIntervalMs, exec.signal)
+      }
+
+      const source = videoSourceOf(body)
+      if (source === undefined) {
+        throw new QwenImageError('the finished video task carried no video URL', 'QWEN_VIDEO_NO_VIDEO')
+      }
+      const { data, mediaType } = await downloadVideo(source, requestSignal(exec, config.videoTimeoutMs))
+      await mkdir(directory, { recursive: true })
+      const file = join(directory, 'video_' + stamp() + '_1' + videoExtensionOf(mediaType))
+      await writeFile(file, data)
+      const video = { path: file, bytes: data.byteLength, mediaType }
+      const usage = body?.usage ?? {}
+      const durationSeconds = usage.video_duration ?? usage.duration
+      if (Number.isInteger(durationSeconds)) video.durationSeconds = durationSeconds
+      const ratio = usage.video_ratio ?? usage.ratio
+      if (isNonBlankString(ratio)) video.ratio = ratio
+      return { model: options.model, taskId, status: 'succeeded', video }
+    },
+    presentCall(args) {
+      const input = args !== null && typeof args === 'object' ? args : {}
+      return {
+        card: 'generic',
+        title: 'Generate video (' + (typeof input.model === 'string' ? input.model : config.defaultVideoModel) + ')',
+        kind: 'other',
+        rawInput: {
+          prompt: typeof input.prompt === 'string' ? input.prompt : undefined,
+          duration: typeof input.duration === 'number' ? input.duration : config.defaultVideoDuration,
+          resolution: typeof input.resolution === 'string' ? input.resolution : config.defaultVideoResolution,
         },
       }
     },
