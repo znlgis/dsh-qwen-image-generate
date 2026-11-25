@@ -1,7 +1,6 @@
 {
   "name": "@dsh-gis/dsh-qwen-image-generate",
   "version": "1.0.0",
-  "private": true,
   "description": "Generate images with the Qwen Token Plan image models (qwen-image-3.0-pro, wan2.7-image, ...) and save them into the session workspace.",
   "type": "module",
   "exports": {
