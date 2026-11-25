@@ -1,0 +1,14 @@
+- insert:
+    - id: dsh-qwen-image-generate
+      name: "@dsh-gis/dsh-qwen-image-generate"
+      config:
+        # Credential reference resolved through the DSH credential store (falling
+        # back to the launch environment, the project's .env, and the harness-home
+        # .env). This profile already stores the Token Plan key under
+        # DASHSCOPE_API_KEY; point the reference at another name to keep the
+        # plan key apart from a DashScope key. Never put the sk-sp- key here.
+        apiKeyEnv: DASHSCOPE_API_KEY
+        baseUrl: https://token-plan.maas.qianwenaiapi.com/api/v1/services/aigc/multimodal-generation/generation
+        defaultModel: wan2.7-image
+        defaultSize: 1024*1024
+        timeoutMs: 180000

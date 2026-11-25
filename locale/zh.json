@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "千问生图",
+    "description": "提供 qwen_image_generate 工具，用千问 Token Plan 的生图模型（qwen-image-3.0-pro、wan2.7-image 等）按文字描述生成图片，并保存到当前会话的工作目录。API Key 从名为 QWEN_TOKEN_PLAN_API_KEY 的凭据中读取；生成时会把提示词发送到千问 Token Plan 接口并计入套餐用量。关闭该插件后工具即消失。"
+  }
+}

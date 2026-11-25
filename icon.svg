@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" fill="none" role="img" aria-label="Qwen image generation">
+  <defs>
+    <linearGradient id="qwen-image-frame" x1="6" y1="7" x2="30" y2="29" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67C7FE"/>
+      <stop offset="1" stop-color="#324DE2"/>
+    </linearGradient>
+    <linearGradient id="qwen-image-spark" x1="22" y1="6" x2="30" y2="14" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#45E7A4"/>
+      <stop offset="1" stop-color="#145AF3"/>
+    </linearGradient>
+    <clipPath id="qwen-image-clip">
+      <rect x="6" y="7" width="20" height="20" rx="4.2"/>
+    </clipPath>
+  </defs>
+  <rect x="6" y="7" width="20" height="20" rx="4.2" fill="url(#qwen-image-frame)" fill-opacity="0.14" stroke="url(#qwen-image-frame)" stroke-width="2"/>
+  <g clip-path="url(#qwen-image-clip)">
+    <circle cx="12.4" cy="13.6" r="2.1" fill="url(#qwen-image-frame)"/>
+    <path d="M4.6 27.6L11.4 20.2C12.1 19.4 13.3 19.4 14 20.2L18.1 24.6L21.1 21.4C21.8 20.6 23 20.6 23.7 21.4L27.4 25.4L27.4 27.6L4.6 27.6Z" fill="url(#qwen-image-frame)"/>
+  </g>
+  <path d="M26.4 5.2L27.7 8.5L31 9.8L27.7 11.1L26.4 14.4L25.1 11.1L21.8 9.8L25.1 8.5Z" fill="url(#qwen-image-spark)"/>
+  <path d="M29.6 16.2L30.3 18L32.1 18.7L30.3 19.4L29.6 21.2L28.9 19.4L27.1 18.7L28.9 18Z" fill="url(#qwen-image-spark)"/>
+</svg>
