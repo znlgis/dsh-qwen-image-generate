@@ -1,5 +1,5 @@
 // Offline harness for dsh-qwen-image-generate: stubs fetch + ctx services, exercises both tools.
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -31,32 +31,110 @@ let taskOnePolls = 0
 let rejectBatchField = false
 let singleImageSerial = 0
 let transientFailuresLeft = 0
+let unknownPolls = 0
+let flakyPolls = 0
 const json = (value) => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } })
 const failure = (status, value) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
+const imageBodyWith = (image) => ({
+  ...IMAGE_BODY,
+  output: {
+    ...IMAGE_BODY.output,
+    choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: [{ image }] } }],
+  },
+})
+const videoSucceeded = (taskId) => json({
+  output: { task_id: taskId, task_status: 'SUCCEEDED', video_url: 'https://cdn.example/v.mp4' },
+  usage: { video_duration: 5, video_ratio: '16:9' },
+})
 
 globalThis.fetch = async (url, init) => {
   const target = String(url)
   calls.push({ url: target, init })
+  // A hung transfer must reject when its caller cancels, like fetch does. The
+  // ref'd timer keeps this process alive: AbortSignal.timeout timers are unref'd,
+  // so a bare await would let Node exit before the timeout can fire.
+  const hangUntilAborted = (name = 'AbortError') => new Promise((_resolve, reject) => {
+    const watchdog = setTimeout(() => reject(new Error('the test transfer was never aborted')), 30_000)
+    const abort = () => {
+      clearTimeout(watchdog)
+      reject(Object.assign(new Error('The operation was aborted'), { name }))
+    }
+    if (init?.signal?.aborted) abort()
+    else init?.signal?.addEventListener('abort', abort, { once: true })
+  })
   if (target.endsWith('/video-synthesis')) {
     const body = JSON.parse(String(init?.body))
-    const taskId = body.input.prompt === 'hang forever' ? 'task-pending' : 'task-1'
+    const prompt = body.input?.prompt ?? ''
+    if (prompt === 'slow submit') return hangUntilAborted('TimeoutError')
+    const taskId = prompt === 'hang forever' ? 'task-pending'
+      : prompt === 'hang one' ? 'task-pending-1'
+        : prompt === 'hang two' ? 'task-pending-2'
+          : prompt === 'unknown then ok' ? 'task-unknown'
+            : prompt === 'always unknown' ? 'task-dead'
+              : prompt === 'flaky query' ? 'task-flaky'
+                : prompt === 'slow download' ? 'task-download-slow'
+                  : prompt === 'huge video' ? 'task-huge-video'
+                    : prompt === 'timeout query' ? 'task-timeout-query'
+                      : 'task-1'
     return json({ request_id: 'req-v', output: { task_id: taskId, task_status: 'PENDING' } })
+  }
+  if (target.includes('/tasks/task-unknown')) {
+    unknownPolls += 1
+    if (unknownPolls <= 2) return json({ output: { task_id: 'task-unknown' } })
+    return videoSucceeded('task-unknown')
+  }
+  if (target.includes('/tasks/task-dead')) return json({ output: { task_id: 'task-dead' } })
+  if (target.includes('/tasks/task-flaky')) {
+    flakyPolls += 1
+    if (flakyPolls <= 2) return failure(503, { code: 'ServiceUnavailable', message: 'try again' })
+    return videoSucceeded('task-flaky')
+  }
+  if (target.includes('/tasks/task-download-slow')) {
+    return json({ output: { task_id: 'task-download-slow', task_status: 'SUCCEEDED', video_url: 'https://cdn.example/slow.mp4' } })
+  }
+  if (target.includes('/tasks/task-huge-video')) {
+    return json({ output: { task_id: 'task-huge-video', task_status: 'SUCCEEDED', video_url: 'https://cdn.example/huge.mp4' } })
+  }
+  if (target.includes('/tasks/task-timeout-query')) return hangUntilAborted('TimeoutError')
+  if (target.includes('/tasks/task-pending-')) {
+    return json({ output: { task_id: target.slice(target.lastIndexOf('/') + 1), task_status: 'RUNNING' } })
   }
   if (target.includes('/tasks/task-1')) {
     taskOnePolls += 1
     if (taskOnePolls < 2) return json({ output: { task_id: 'task-1', task_status: 'RUNNING' } })
-    return json({
-      output: { task_id: 'task-1', task_status: 'SUCCEEDED', video_url: 'https://cdn.example/v.mp4' },
-      usage: { video_duration: 5, video_ratio: '16:9' },
-    })
+    return videoSucceeded('task-1')
   }
   if (target.includes('/tasks/task-pending')) return json({ output: { task_id: 'task-pending', task_status: 'RUNNING' } })
   if (target === 'https://cdn.example/v.mp4') {
     return new Response(MP4, { status: 200, headers: { 'content-type': 'video/mp4' } })
   }
+  if (target === 'https://cdn.example/slow.mp4') return hangUntilAborted()
+  if (target === 'https://cdn.example/huge.mp4') {
+    return new Response(MP4, {
+      status: 200,
+      headers: { 'content-type': 'video/mp4', 'content-length': String(2 * 1024 * 1024 * 1024) },
+    })
+  }
+  if (target === 'https://cdn.example/huge.png') {
+    return new Response(PNG, {
+      status: 200,
+      headers: { 'content-type': 'image/png', 'content-length': String(200 * 1024 * 1024) },
+    })
+  }
+  if (target === 'https://cdn.example/octet.bin') {
+    return new Response(PNG, { status: 200, headers: { 'content-type': 'application/octet-stream' } })
+  }
   if (target.startsWith('https://token-plan')) {
     const body = JSON.parse(String(init?.body))
     const prompt = body.input?.messages?.[0]?.content?.find((part) => typeof part.text === 'string')?.text ?? ''
+    if (prompt === 'budget slow') return hangUntilAborted()
+    if (prompt === 'bad size') {
+      return failure(400, { code: 'InvalidParameter', message: 'size must be one of 1024*1024, 1536*1024', request_id: 'req-size' })
+    }
+    if (prompt === 'huge image') return json(imageBodyWith('https://cdn.example/huge.png'))
+    if (prompt === 'empty result') return json({ output: { choices: [] }, request_id: 'req-empty' })
+    if (prompt === 'data url') return json(imageBodyWith('data:image/png;base64,' + PNG.toString('base64')))
+    if (prompt === 'octet image') return json(imageBodyWith('https://cdn.example/octet.bin'))
     if (transientFailuresLeft > 0) {
       transientFailuresLeft -= 1
       return failure(503, { code: 'ServiceUnavailable', message: 'service is busy' })
@@ -69,13 +147,7 @@ globalThis.fetch = async (url, init) => {
     }
     if (rejectBatchField) {
       singleImageSerial += 1
-      return json({
-        ...IMAGE_BODY,
-        output: {
-          ...IMAGE_BODY.output,
-          choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: [{ image: 'https://cdn.example/single-' + singleImageSerial + '.png' }] } }],
-        },
-      })
+      return json(imageBodyWith('https://cdn.example/single-' + singleImageSerial + '.png'))
     }
     return json(IMAGE_BODY)
   }
@@ -132,26 +204,44 @@ const expect = (label, actual, expected) => {
   console.log((ok ? 'PASS ' : 'FAIL ') + label)
 }
 const mod = await import('./index.js')
-const registered = {}
-const ctx = {
-  effect: (fn) => fn(),
-  tools: { register: (definition) => { registered[definition.name] = definition; return () => {} } },
-  get: (name) => {
-    if (name === 'credentials') return { resolve: async () => ({ value: 'sk-sp-test', source: 'store' }) }
-    if (name === 'workingDirectory') return { ensure: async () => dir }
-    if (name === 'attachments') {
-      return {
-        saveImage: async ({ data, name: fileName }) => {
-          saved.push({ bytes: data.byteLength, fileName })
-          return { attachmentId: 'sha256:abc123', ...STORED, name: fileName }
-        },
+
+/** Register the plugin against the shared stub services and return its tools. */
+const makePlugin = (overrides = {}, options = {}) => {
+  const tools = {}
+  const ctx = {
+    effect: (fn) => fn(),
+    tools: { register: (definition) => { tools[definition.name] = definition; return () => {} } },
+    get: (name) => {
+      if (name === 'credentials' && options.credentials !== false) {
+        return { resolve: async () => ({ value: 'sk-sp-test', source: 'store' }) }
       }
-    }
-    if (name === 'llm') return { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) }
-    return undefined
-  },
+      if (name === 'workingDirectory') return { ensure: async () => dir }
+      if (name === 'attachments') {
+        return {
+          saveImage: async ({ data, name: fileName }) => {
+            saved.push({ bytes: data.byteLength, fileName })
+            return { attachmentId: 'sha256:abc123', ...STORED, name: fileName }
+          },
+        }
+      }
+      if (name === 'llm') return { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) }
+      return undefined
+    },
+  }
+  mod.apply(ctx, { videoPollIntervalMs: 50, videoWaitMs: 1000, ...overrides })
+  return tools
 }
-mod.apply(ctx, { videoPollIntervalMs: 50, videoWaitMs: 1000 })
+
+/** Run one tool call and capture either its value or its failure. */
+const attempt = async (tool, args, execOverride = exec) => {
+  try {
+    return { value: await tool.execute(args, execOverride) }
+  } catch (error) {
+    return { error }
+  }
+}
+
+const registered = makePlugin()
 const exec = { agent: { id: 'a', options: {}, session: { requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) } }, signal: undefined }
 for (const definition of Object.values(registered)) {
   checkSchema(definition.parameters, definition.name + '.parameters')
@@ -330,6 +420,7 @@ const manifestLines = (await readFile(join(dir, 'qwen-images', '.manifest.jsonl'
 const manifestHit = manifestLines.find((line) => line.file === seriesValue.images[0].path)
 expect('manifest records the prompt', manifestHit.prompt, 'a rat holding coins')
 expect('manifest records the model', manifestHit.model, 'wan2.7-image-pro')
+expect('manifest records the record kind', manifestHit.kind, 'image')
 expect('manifest path is returned', seriesValue.manifestPath, join(dir, 'qwen-images', '.manifest.jsonl'))
 
 // --- image tool: negative_prompt on a model that ignores it ---------------
@@ -361,6 +452,197 @@ const retried = await registered.qwen_image_generate.execute({ prompt: 'a green 
 expect('transient failure is retried', calls.filter((call) => String(call.url).includes('/multimodal-generation')).length, 2)
 expect('retry still returns the image', retried.images.length, 1)
 transientFailuresLeft = 0
+
+
+// --- image tool: an unrelated 400 is not retried per image ----------------
+calls.length = 0
+const badSize = await attempt(registered.qwen_image_generate, { prompt: 'bad size', count: 3 })
+expect('unrelated 400 is not retried per image', calls.filter((call) => String(call.url).includes('/multimodal-generation')).length, 1)
+expect('unrelated 400 keeps the request failure code', badSize.error?.code, 'QWEN_IMAGE_REQUEST_FAILED')
+expect('unrelated 400 surfaces the provider reason', String(badSize.error?.message).includes('size must be one of'), true)
+
+// --- image tool: reserved device names never become file stems ------------
+expect('reserved file stem rejected', await budgetRejected({ prompt: 'a cat', name_prefix: 'CON' }), 'INVALID_ARGS')
+
+// --- image tool: data URLs and signature sniffing -------------------------
+const dataUrlImage = await registered.qwen_image_generate.execute({ prompt: 'data url' }, exec)
+expect('data URL image saved with its sniffed extension', dataUrlImage.images[0].path.endsWith('.png'), true)
+const octetImage = await registered.qwen_image_generate.execute({ prompt: 'octet image' }, exec)
+expect('media type falls back to the signature', octetImage.images[0].path.endsWith('.png'), true)
+
+// --- image tool: oversized downloads are refused --------------------------
+const hugeImage = await attempt(registered.qwen_image_generate, { prompt: 'huge image' })
+expect('oversized image download is refused', String(hugeImage.error?.message).includes('maxImageBytes'), true)
+expect('all-download failure names a source', String(hugeImage.error?.message).includes('cdn.example/huge.png'), true)
+
+// --- image tool: a spent generation budget still saves finished images ----
+const budgeted = makePlugin({ timeoutMs: 1500 })
+const budgetOnly = await attempt(budgeted.qwen_image_generate, { prompt: 'budget slow', output_dir: 'budget-images' })
+expect('image budget expiry gets its own code', budgetOnly.error?.code, 'QWEN_IMAGE_TIMEOUT')
+expect('image budget message is actionable', String(budgetOnly.error?.message).includes('pass fewer prompts per call'), true)
+const budgetPartial = await attempt(budgeted.qwen_image_generate, {
+  prompts: ['a budget fast', 'budget slow'],
+  output_dir: 'budget-images',
+})
+expect('spent generation budget still saves finished images', budgetPartial.value?.images?.length, 1)
+expect('partial budget run reports the loss in warnings', Array.isArray(budgetPartial.value?.warnings)
+  && budgetPartial.value.warnings.some((warning) => warning.includes('budget ran out')), true)
+const budgetManifest = (await readFile(join(dir, 'budget-images', '.manifest.jsonl'), 'utf8'))
+  .trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line))
+expect('budget run appends its manifest', budgetManifest.every((line) => line.kind === 'image'), true)
+
+// --- image tool: a long negative_prompt is bounded and reported -----------
+calls.length = 0
+const longNegative = await registered.qwen_image_generate.execute({
+  prompt: 'a cat',
+  model: 'qwen-image-3.0-pro',
+  negative_prompt: 'x'.repeat(600),
+}, exec)
+expect('trimmed negative_prompt is reported', Array.isArray(longNegative.warnings)
+  && longNegative.warnings.some((warning) => warning.includes('cut to its first 500')), true)
+const longNegativeBody = JSON.parse(String(calls.filter((call) => String(call.url).includes('/multimodal-generation')).pop().init.body))
+expect('negative_prompt is bounded before sending', longNegativeBody.parameters.negative_prompt.length, 500)
+
+// --- video tool: concurrent submissions keep every billed task id ---------
+calls.length = 0
+await Promise.all([
+  registered.qwen_video_generate.execute({ prompt: 'hang one', wait_seconds: 1 }, exec),
+  registered.qwen_video_generate.execute({ prompt: 'hang two', wait_seconds: 1 }, exec),
+])
+const ledgerAfter = JSON.parse(await readFile(join(dir, 'qwen-videos', '.pending-tasks.json'), 'utf8'))
+expect('concurrent submissions keep every task id', [
+  Object.hasOwn(ledgerAfter, 'task-pending-1'),
+  Object.hasOwn(ledgerAfter, 'task-pending-2'),
+], [true, true])
+
+// --- video tool: status-less polls are tolerated, endless ones fail -------
+calls.length = 0
+unknownPolls = 0
+const unknownThenOk = await registered.qwen_video_generate.execute({ prompt: 'unknown then ok', wait_seconds: 5 }, exec)
+expect('status-less polls are tolerated', unknownThenOk.status, 'succeeded')
+const alwaysUnknown = await attempt(registered.qwen_video_generate, { prompt: 'always unknown', wait_seconds: 5 })
+expect('a status-less task stays pending', alwaysUnknown.value?.status, 'pending')
+expect('status-less result explains how to resume', String(alwaysUnknown.value?.message).includes('task_id'), true)
+const ledgerUnknown = JSON.parse(await readFile(join(dir, 'qwen-videos', '.pending-tasks.json'), 'utf8'))
+expect('a status-less task keeps its billed id', Object.hasOwn(ledgerUnknown, 'task-dead'), true)
+
+// --- video tool: a poll timeout returns pending, not retried extra -------
+const impatientPoll = makePlugin({ videoWaitMs: 500 })
+const slowPoll = await impatientPoll.qwen_video_generate.execute({ prompt: 'timeout query', wait_seconds: 1 }, exec)
+expect('a poll timeout still returns the task id', slowPoll.status, 'pending')
+expect('a poll timeout keeps its task id', slowPoll.taskId, 'task-timeout-query')
+
+// --- video tool: transient query failures are retried ---------------------
+calls.length = 0
+flakyPolls = 0
+const flaky = await registered.qwen_video_generate.execute({ prompt: 'flaky query', wait_seconds: 5 }, exec)
+expect('transient query failures are retried', flaky.status, 'succeeded')
+expect('query retry count matches the failures', flakyPolls, 3)
+
+// --- image tool: a missing key and an empty answer are actionable ---------
+const noKey = makePlugin({ apiKeyEnv: 'QWEN_TEST_MISSING_KEY' }, { credentials: false })
+const noKeyResult = await attempt(noKey.qwen_image_generate, { prompt: 'a cat' })
+expect('missing api key gets its own code', noKeyResult.error?.code, 'QWEN_IMAGE_NO_API_KEY')
+expect('missing api key names the credential', String(noKeyResult.error?.message).includes('QWEN_TEST_MISSING_KEY'), true)
+const emptyResult = await attempt(registered.qwen_image_generate, { prompt: 'empty result' })
+expect('an answer with no image is actionable', emptyResult.error?.code, 'QWEN_IMAGE_NO_IMAGE')
+
+// --- image tool: caller cancellation surfaces as cancellation -------------
+const controller = new AbortController()
+const abortPromise = attempt(registered.qwen_image_generate, { prompt: 'budget slow', output_dir: 'abort-images' }, {
+  ...exec,
+  signal: controller.signal,
+})
+setTimeout(() => controller.abort(), 50)
+const cancelled = await abortPromise
+expect('caller cancellation keeps the abort shape', cancelled.error?.name, 'AbortError')
+
+// --- video tool: a resumable task reports its recorded model --------------
+calls.length = 0
+const primePending = await registered.qwen_video_generate.execute({
+  prompt: 'hang forever',
+  model: 'wan3.0-video-prime',
+  wait_seconds: 1,
+}, exec)
+expect('prime pending submits the requested model', JSON.parse(calls.find((call) => call.url.endsWith('/video-synthesis')).init.body).model, 'wan3.0-video-prime')
+const primeResume = await registered.qwen_video_generate.execute({ task_id: 'task-pending', prompt: 'ignored prompt', wait_seconds: 1 }, exec)
+expect('resume reports the recorded model', primeResume.model, 'wan3.0-video-prime')
+expect('resume warns that prompt was ignored', Array.isArray(primeResume.warnings)
+  && primeResume.warnings.some((warning) => warning.includes('prompt/media were ignored')), true)
+
+// --- video tool: the manifest records the finished render -----------------
+const videoManifest = (await readFile(join(dir, 'qwen-videos', '.manifest.jsonl'), 'utf8'))
+  .trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line))
+const videoRecord = videoManifest.find((line) => line.taskId === 'task-1')
+expect('video manifest records the record kind', videoRecord?.kind, 'video')
+expect('video manifest records the prompt', videoRecord?.prompt, 'a cat on a roof')
+expect('video manifest records the saved file', typeof videoRecord?.file, 'string')
+
+// --- video tool: an interrupted download keeps the task id ----------------
+const impatient = makePlugin({ videoTimeoutMs: 400 })
+calls.length = 0
+const interrupted = await impatient.qwen_video_generate.execute({ task_id: 'task-download-slow', wait_seconds: 1 }, exec)
+expect('interrupted video download stays pending', interrupted.status, 'pending')
+expect('interrupted download explains how to resume', String(interrupted.message).includes('download was interrupted'), true)
+const ledgerAfterInterrupt = JSON.parse(await readFile(join(dir, 'qwen-videos', '.pending-tasks.json'), 'utf8'))
+expect('interrupted download keeps its task id', Object.hasOwn(ledgerAfterInterrupt, 'task-download-slow'), true)
+
+// --- video tool: oversized download and malformed endpoint fail clearly ---
+const hugeVideo = await attempt(registered.qwen_video_generate, { prompt: 'huge video', wait_seconds: 5 })
+expect('oversized video download is refused', String(hugeVideo.error?.message).includes('maxVideoBytes'), true)
+const badEndpoint = makePlugin({ videoBaseUrl: 'https://token-plan.example/api/v1/services/aigc/image-generation' })
+calls.length = 0
+const badEndpointResult = await attempt(badEndpoint.qwen_video_generate, { prompt: 'anything', wait_seconds: 1 })
+expect('bad videoBaseUrl fails with a config code', badEndpointResult.error?.code, 'QWEN_VIDEO_BAD_CONFIG')
+expect('bad videoBaseUrl makes no request', calls.length, 0)
+
+// --- argument guards: output_dir must be a string -------------------------
+expect('image output_dir must be a string', await budgetRejected({ prompt: 'a cat', output_dir: 42 }), 'INVALID_ARGS')
+expect('video output_dir must be a string', (await attempt(registered.qwen_video_generate, { prompt: 'x', output_dir: 42 })).error?.code, 'INVALID_ARGS')
+
+// --- output_dir cannot escape through a workspace link --------------------
+let linkMade = false
+try {
+  await symlink(tmpdir(), join(dir, 'escape-link'), 'junction')
+  linkMade = true
+} catch {
+  try {
+    await symlink(tmpdir(), join(dir, 'escape-link'))
+    linkMade = true
+  } catch {
+    linkMade = false
+  }
+}
+if (linkMade) {
+  const escapedLink = await attempt(registered.qwen_image_generate, { prompt: 'a cat', output_dir: 'escape-link/qwen' })
+  expect('output_dir cannot escape through a workspace link', escapedLink.error?.code, 'INVALID_ARGS')
+  await rm(join(dir, 'escape-link'), { recursive: true, force: true })
+} else {
+  console.log('SKIP output_dir link escape (symlinks unavailable)')
+}
+
+// --- video tool: a corrupt ledger is preserved, not silently erased -------
+const corruptDir = join(dir, 'corrupt-ledger')
+await mkdir(corruptDir, { recursive: true })
+await writeFile(join(corruptDir, '.pending-tasks.json'), '{"task-broken": ')
+const corruptRun = await registered.qwen_video_generate.execute({
+  prompt: 'hang forever',
+  output_dir: 'corrupt-ledger',
+  wait_seconds: 1,
+}, exec)
+expect('corrupt ledger does not block a submission', corruptRun.status, 'pending')
+const corruptFiles = await readdir(corruptDir)
+expect('corrupt ledger is preserved for inspection', corruptFiles.some((name) => name.startsWith('.pending-tasks.json.corrupt-')), true)
+
+// --- video tool: a submission timeout is unknown, not a network failure ---
+const impatientSubmit = makePlugin({ videoTimeoutMs: 300 })
+const slowSubmit = await attempt(impatientSubmit.qwen_video_generate, { prompt: 'slow submit', wait_seconds: 1 })
+expect('submission timeout reports an unknown-state code', slowSubmit.error?.code, 'QWEN_VIDEO_SUBMIT_UNKNOWN')
+
+// --- video tool: waiting past the host default is flagged -----------------
+const overHostWait = await registered.qwen_video_generate.execute({ prompt: 'wait warning check', wait_seconds: 600 }, exec)
+expect('over-host wait gets an advisory warning', Array.isArray(overHostWait.warnings)
+  && overHostWait.warnings.some((warning) => warning.includes('wait_seconds')), true)
 
 await rm(dir, { recursive: true, force: true })
 if (failures.length > 0) {

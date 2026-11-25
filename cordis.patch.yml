@@ -13,7 +13,8 @@
         defaultSize: 1024*1024
         # Keep this under the host's default 120 s per-call timeout: a synchronous
         # image call has no task id to resume, so a budget the host outlives
-        # loses a paid result.
+        # loses a paid result. About 15 s of it is reserved for downloading
+        # finished images after the generation phase gives up.
         timeoutMs: 110000
         # Asynchronous video-synthesis endpoint. The task-query URL
         # (@ .../tasks/{task_id}) is derived from this path, so keep the whole
@@ -29,3 +30,10 @@
         # poll window leaves the task running (and billed) while the process is
         # killed mid-poll, losing the task id.
         videoWaitMs: 90000
+        # Download caps: a runaway response is refused instead of exhausting
+        # memory. Raise these only when a model legitimately returns bigger files.
+        maxImageBytes: 67108864
+        maxVideoBytes: 536870912
+        # Operational fallback for the output directory, used only when the
+        # session directory is unavailable. Leave empty for the session directory.
+        outputDir: ""

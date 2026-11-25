@@ -20,7 +20,8 @@
  *   `videoWaitMs` stays under the host's default per-call timeout so a poll
  *   window does not outlive the tool call that owns it
  * - `outputDir`  directory used when the session directory is unavailable
- * - `timeoutMs`  per-request image budget
+ * - `timeoutMs`  budget for one image call, split between requests and downloads
+ * - `maxImageBytes` / `maxVideoBytes` download size caps
  *
  * The plugin imports no Harness package at runtime: profile-installed bundles
  * resolve Harness packages through the loader, and staying dependency-free keeps
@@ -29,8 +30,8 @@
  * @module dsh-qwen-image
  */
 
-import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative as relativePath, resolve as resolvePath, sep } from 'node:path'
+import { appendFile, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative as relativePath, resolve as resolvePath, sep } from 'node:path'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-qwen-image'
@@ -56,13 +57,34 @@ const DEFAULT_VIDEO_POLL_INTERVAL_MS = 5_000
 const DEFAULT_VIDEO_WAIT_MS = 90_000
 const DEFAULT_SIZE = '1024*1024'
 /**
- * Per-request budget for the synchronous image endpoint. Kept under the host's
- * default 120 s per-call timeout for the same reason videoWaitMs is: a budget
- * longer than the host allows means the exchange is killed before this plugin
- * can report anything, and a synchronous image call has no task id to resume,
- * so a paid result is simply lost.
+ * Whole-call budget for one image request batch. Kept under the host's default
+ * 120 s per-call timeout: a budget the host outlives means the call is killed
+ * before this plugin can report anything, and a synchronous image request has
+ * no task id to resume, so a paid result is simply lost. A slice of it is
+ * reserved for downloading images the generation phase already paid for.
  */
 const DEFAULT_TIMEOUT_MS = 110_000
+/**
+ * Share of one image call's budget kept back for downloading generated files.
+ * Result URLs expire and the images are already billed, so the fetch phase must
+ * not lose the race against the generation budget.
+ */
+const DOWNLOAD_RESERVE_MS = 15_000
+/** Floor for the image download phase, even when generation spent the budget. */
+const DOWNLOAD_FLOOR_MS = 5_000
+/** Ceiling for the image download phase, so one call stays near the budget. */
+const DOWNLOAD_CEILING_MS = 30_000
+/** Per-request budget for fetching a finished video; the task id survives a failure. */
+const VIDEO_DOWNLOAD_BUDGET_MS = 60_000
+/** Attempts (including the first) for one retryable video download. */
+const MAX_VIDEO_DOWNLOAD_ATTEMPTS = 3
+/** Download caps: one runaway response must not exhaust memory. */
+const DEFAULT_MAX_IMAGE_BYTES = 64 * 1024 * 1024
+const DEFAULT_MAX_VIDEO_BYTES = 512 * 1024 * 1024
+/** Submission budget: creating a task is quick and must not outlive the host's kill window. */
+const VIDEO_SUBMIT_BUDGET_MS = 60_000
+/** The host's default per-call timeout, used only for an advisory warning. */
+const HOST_DEFAULT_TIMEOUT_MS = 120_000
 /** Hard cap on images one call may produce, whatever the parameter shape. */
 const MAX_IMAGES_PER_CALL = 6
 /** Attempts (including the first) for one retryable image request or download. */
@@ -144,6 +166,8 @@ function resolveConfig(raw) {
     videoWaitMs: positive(config.videoWaitMs, DEFAULT_VIDEO_WAIT_MS),
     outputDir: text(config.outputDir, ''),
     timeoutMs: positive(config.timeoutMs, DEFAULT_TIMEOUT_MS),
+    maxImageBytes: positive(config.maxImageBytes, DEFAULT_MAX_IMAGE_BYTES),
+    maxVideoBytes: positive(config.maxVideoBytes, DEFAULT_MAX_VIDEO_BYTES),
   }
 }
 
@@ -261,7 +285,9 @@ async function requestGeneration(options) {
       signal,
     })
   } catch (error) {
-    if (error?.name === 'AbortError') throw error
+    // A timeout leaves it unknown whether the request was billed, so it is
+    // surfaced as a cancellation instead of being retried and billed twice.
+    if (isAbortError(error)) throw error
     throw new QwenImageError(`the image request failed before a response: ${error?.message ?? String(error)}`, 'QWEN_IMAGE_NETWORK')
   }
 
@@ -284,21 +310,83 @@ async function requestGeneration(options) {
   }
 }
 
+/** One actionable failure for a download that exceeds its configured cap. */
+function oversizeError(what, bytes, limit, configKey, code) {
+  return new QwenImageError(
+    what + ' is ' + bytes + ' bytes, over the ' + limit + '-byte cap; raise ' + configKey + ' to accept it',
+    code,
+  )
+}
+
+/**
+ * Read a response body while never buffering more than `limitBytes`. A stated
+ * Content-Length over the cap is refused before the body is read; otherwise the
+ * stream is abandoned as soon as the accumulated size crosses the cap, so a
+ * mislabeled or endless response cannot exhaust memory.
+ */
+async function readBodyLimited(response, limitBytes, what, configKey, code) {
+  const stated = Number(response.headers.get('content-length'))
+  if (Number.isFinite(stated) && stated > limitBytes) throw oversizeError(what, stated, limitBytes, configKey, code)
+  if (response.body === null) {
+    const buffer = new Uint8Array(await response.arrayBuffer())
+    if (buffer.byteLength > limitBytes) throw oversizeError(what, buffer.byteLength, limitBytes, configKey, code)
+    return buffer
+  }
+  const reader = response.body.getReader()
+  const chunks = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > limitBytes) {
+        await reader.cancel().catch(() => {})
+        throw oversizeError(what, total, limitBytes, configKey, code)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const data = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    data.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return data
+}
+
 /** Download one produced image into bytes plus its media type. */
-async function downloadImage(url, signal) {
+async function downloadImage(url, signal, maxBytes) {
   if (url.startsWith('data:')) {
     const comma = url.indexOf(',')
     if (comma === -1) throw new QwenImageError('the returned data URL carried no payload', 'QWEN_IMAGE_BAD_RESPONSE')
     const header = url.slice(5, comma)
-    const base64 = url.slice(comma + 1)
-    const mediaType = header.split(';')[0]?.trim() || 'image/png'
-    return { data: new Uint8Array(Buffer.from(base64, 'base64')), mediaType }
+    if (!header.split(';').map((part) => part.trim().toLowerCase()).includes('base64')) {
+      throw new QwenImageError('the returned data URL is not base64-encoded', 'QWEN_IMAGE_BAD_RESPONSE')
+    }
+    const data = new Uint8Array(Buffer.from(url.slice(comma + 1), 'base64'))
+    if (data.byteLength > maxBytes) {
+      throw oversizeError('the returned data URL image', data.byteLength, maxBytes, 'maxImageBytes', 'QWEN_IMAGE_DOWNLOAD_TOO_LARGE')
+    }
+    // The media type declared by a data URL is a hint; the signature decides.
+    const mediaType = sniffMediaType(data)
+    if (mediaType === undefined) {
+      throw new QwenImageError('the returned data URL is not a PNG/JPEG/WebP/GIF image', 'QWEN_IMAGE_BAD_RESPONSE')
+    }
+    return { data, mediaType }
   }
   const response = await fetch(url, { signal })
   if (!response.ok) {
-    throw new QwenImageError(`downloading the generated image failed with HTTP ${response.status}`, 'QWEN_IMAGE_DOWNLOAD_FAILED')
+    throw new QwenImageError(
+      'downloading the generated image failed with HTTP ' + response.status,
+      'QWEN_IMAGE_DOWNLOAD_FAILED',
+      response.status,
+    )
   }
-  const buffer = new Uint8Array(await response.arrayBuffer())
+  const buffer = await readBodyLimited(response, maxBytes, 'the generated image', 'maxImageBytes', 'QWEN_IMAGE_DOWNLOAD_TOO_LARGE')
   const header = (response.headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase()
   const mediaType = header === 'image/jpeg' || header === 'image/webp' || header === 'image/gif' || header === 'image/png'
     ? header
@@ -343,6 +431,16 @@ async function writeUniqueFile(directory, stem, extension, data) {
   throw new QwenImageError('could not find a free file name in ' + directory, 'QWEN_IMAGE_NAME_CONFLICT')
 }
 
+/**
+ * Append one batch of records to the output directory's JSONL manifest. One
+ * append per batch keeps concurrent calls from interleaving their lines.
+ */
+async function appendManifest(directory, entries) {
+  const file = join(directory, MANIFEST_FILE)
+  await appendFile(file, entries.map((entry) => JSON.stringify(entry)).join(String.fromCharCode(10)) + String.fromCharCode(10))
+  return file
+}
+
 /** Timestamp fragment shared by one batch so its files sort together. */
 function stamp(date = new Date()) {
   const pad = (value) => String(value).padStart(2, '0')
@@ -360,8 +458,9 @@ async function outputDirectory(ctx, configured, requested, exec, leaf) {
   if (explicit !== undefined) {
     const target = resolveAgainstSession(explicit)
     // The model chooses this directory, so keep it inside the workspace: a
-    // stray absolute path must not drop files into the system tree.
-    if (!isInside(session, target)) {
+    // stray absolute path — or a link inside the workspace pointing out of it —
+    // must not drop generated files into the system tree.
+    if (!await resolvesInside(session, target)) {
       throw new ImageArgsError(`output_dir must stay inside the session workspace (${session}); got "${explicit}"`)
     }
     return target
@@ -376,6 +475,35 @@ function isInside(root, candidate) {
   if (step === '') return true
   if (isAbsolute(step)) return false
   return step.split(sep)[0] !== '..'
+}
+
+/** The real path of the nearest existing ancestor, or undefined when unreachable. */
+async function realAncestor(path) {
+  let current = resolvePath(path)
+  for (let step = 0; step < 64; step += 1) {
+    try {
+      return await realpath(current)
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return undefined
+      const parent = dirname(current)
+      if (parent === current) return undefined
+      current = parent
+    }
+  }
+  return undefined
+}
+
+/**
+ * Whether `candidate` is lexically inside `root` and still inside it after
+ * every existing symlink/junction on the way is resolved: a link planted in the
+ * workspace must not redirect generated files outside it.
+ */
+async function resolvesInside(root, candidate) {
+  if (!isInside(root, candidate)) return false
+  const [realRoot, realCandidate] = await Promise.all([realAncestor(root), realAncestor(candidate)])
+  // An unreachable ancestor leaves only the lexical check to go on.
+  if (realRoot === undefined || realCandidate === undefined) return true
+  return isInside(realRoot, realCandidate)
 }
 
 /** Resolve the session's working directory without failing the tool when absent. */
@@ -423,6 +551,12 @@ function combineSignals(caller, timeout) {
   return controller.signal
 }
 
+/** A bounded, single-line rendering of one remote source for a message. */
+function shortSource(source) {
+  const text = String(source ?? '')
+  return text.length <= 120 ? text : text.slice(0, 117) + '...'
+}
+
 /** The file-name part of a path, whatever the platform separator. */
 function baseNameOf(path) {
   const separator = String.fromCharCode(92)
@@ -463,15 +597,20 @@ async function withImageRetry(run, signal) {
 
 /**
  * Whether a 400 means the model rejected the batch count field. A prompt that
- * the provider merely refuses must not be retried once per image, so the
- * fallback only triggers when the message names that parameter.
+ * the provider merely refuses must never be retried once per image: retrying
+ * costs one paid request per image for an answer that cannot change, so the
+ * fallback only triggers when the failure names the count field itself.
  */
 function isBatchCountRejected(error) {
   if (error?.status !== 400) return false
   const message = String(error?.message ?? '').toLowerCase()
-  const named = ['batch', 'count', 'number', 'parameter', 'not support', 'unsupported']
-  if (named.some((token) => message.includes(token))) return true
-  return message.split(' ').some((token) => token === 'n' || token === 'n,' || token === 'n.')
+  // The count field is reported as `n`, "batch", or "count"; a generic
+  // "InvalidParameter" (a rejected size or seed, say) must not match, or a
+  // request that can never succeed would be billed once per image.
+  const namesCount = /(^|[^a-z])(?:n|batch|count)([^a-z]|$)/u.test(message)
+    || /number\s+of\s+images?|image\s+count|batch\s+size/u.test(message)
+  if (!namesCount) return false
+  return /not\s+support|unsupport|invalid|unknown|unexpected|illegal|exceed|maximum|must\s+be|out\s+of\s+range|too\s+large/u.test(message)
 }
 
 /** One file-stem component: no separators, no reserved names, bounded length. */
@@ -485,6 +624,9 @@ function sanitizeFileStem(value) {
   }
   cleaned = cleaned.replace(/^[._]+/u, '').replace(/[._]+$/u, '').slice(0, 60)
   if (cleaned === '' || cleaned === '.' || cleaned === '..') return undefined
+  // Windows device names can never be a file stem; reject them here instead of
+  // letting the create fail later with a platform-specific error.
+  if (/^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/iu.test(cleaned)) return undefined
   return cleaned
 }
 
@@ -509,9 +651,11 @@ async function mapSettled(items, limit, run) {
 }
 
 /** Validate and normalize the model-supplied arguments. */
-/** Validate and normalize the model-supplied arguments. */
 function parseArgs(args, config) {
   if (args === null || typeof args !== 'object') throw new ImageArgsError('arguments must be an object')
+  if (args.output_dir !== undefined && typeof args.output_dir !== 'string') {
+    throw new ImageArgsError('output_dir must be a string')
+  }
   const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
   const rawPrompts = args.prompts
   let prompts
@@ -569,6 +713,7 @@ function parseArgs(args, config) {
   if (negativePrompt !== undefined && typeof negativePrompt !== 'string') {
     throw new ImageArgsError('negative_prompt must be a string')
   }
+  const trimmedNegative = typeof negativePrompt === 'string' ? negativePrompt.trim() : ''
   const images = args.image_urls
   if (images !== undefined) {
     if (!Array.isArray(images) || images.length > 3 || images.some((entry) => !isNonBlankString(entry))) {
@@ -584,7 +729,8 @@ function parseArgs(args, config) {
     size,
     count,
     seed,
-    negativePrompt: typeof negativePrompt === 'string' && negativePrompt.trim() !== '' ? negativePrompt.trim().slice(0, 500) : undefined,
+    negativePrompt: trimmedNegative === '' ? undefined : trimmedNegative.slice(0, 500),
+    negativePromptWasTrimmed: trimmedNegative.length > 500,
     watermark: typeof args.watermark === 'boolean' ? args.watermark : undefined,
     promptExtend: typeof args.prompt_extend === 'boolean' ? args.prompt_extend : undefined,
     images: images?.map((entry) => entry.trim()),
@@ -644,7 +790,7 @@ async function submitVideoTask(options) {
       signal,
     })
   } catch (error) {
-    if (error?.name === 'AbortError') throw error
+    if (isAbortError(error)) throw error
     throw new QwenImageError('the video request failed before a response: ' + (error?.message ?? String(error)), 'QWEN_VIDEO_NETWORK')
   }
   const text = await response.text()
@@ -672,7 +818,9 @@ async function queryVideoTask(url, apiKey, signal) {
   try {
     response = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey }, signal })
   } catch (error) {
-    if (error?.name === 'AbortError') throw error
+    // Abort and timeout both mean the poll did not answer in time; treating the
+    // timeout as a network failure would retry it and overshoot the wait window.
+    if (isAbortError(error)) throw error
     throw new QwenImageError('querying the video task failed before a response: ' + (error?.message ?? String(error)), 'QWEN_VIDEO_NETWORK')
   }
   const text = await response.text()
@@ -702,15 +850,40 @@ function videoSourceOf(body) {
   return undefined
 }
 
+/** Per-directory promise chains that serialize ledger read-modify-write. */
+const ledgerLocks = new Map()
+
 /**
- * Read the pending-task ledger. A missing or corrupt file reads as an empty
- * ledger: bookkeeping must never block a request that already cost quota.
+ * Serialize one ledger update per output directory. Two concurrent video calls
+ * would otherwise both read the old file and the later write would drop the
+ * other call's task id — the id of a render that was already billed.
+ */
+function withLedgerLock(directory, run) {
+  const key = resolvePath(directory)
+  const previous = ledgerLocks.get(key) ?? Promise.resolve()
+  const result = previous.then(run, run)
+  const settled = result.catch(() => {})
+  ledgerLocks.set(key, settled)
+  return result.finally(() => {
+    if (ledgerLocks.get(key) === settled) ledgerLocks.delete(key)
+  })
+}
+
+/**
+ * Read the pending-task ledger. A missing file reads as an empty ledger: a
+ * request that already cost quota must never be blocked by bookkeeping. A
+ * corrupt file is moved aside first, so the next update cannot silently erase
+ * the only trace of task ids that may still be rendering.
  */
 async function readPendingTasks(directory) {
+  const file = join(directory, PENDING_TASKS_FILE)
   try {
-    const parsed = JSON.parse(await readFile(join(directory, PENDING_TASKS_FILE), 'utf8'))
+    const parsed = JSON.parse(await readFile(file, 'utf8'))
     return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
-  } catch {
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      await rename(file, file + '.corrupt-' + Date.now()).catch(() => {})
+    }
     return {}
   }
 }
@@ -722,15 +895,27 @@ async function writePendingTasks(directory, tasks) {
     await rm(file, { force: true })
     return
   }
-  await writeFile(file, JSON.stringify(tasks, null, 2) + '\n')
+  // Write beside the ledger and rename over it: a process killed mid-write must
+  // never leave a truncated ledger that the next update would overwrite with a
+  // single task, losing every other task id.
+  const temporary = file + '.' + process.pid + '-' + Date.now() + '.tmp'
+  await writeFile(temporary, JSON.stringify(tasks, null, 2) + '\n')
+  try {
+    await rename(temporary, file)
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
 /** Record one submitted task so a later call can resume it after a crash. */
 async function rememberPendingTask(directory, taskId, record) {
   try {
-    const tasks = await readPendingTasks(directory)
-    tasks[taskId] = record
-    await writePendingTasks(directory, tasks)
+    await withLedgerLock(directory, async () => {
+      const tasks = await readPendingTasks(directory)
+      tasks[taskId] = record
+      await writePendingTasks(directory, tasks)
+    })
   } catch {
     // Advisory only: never fail a request that already spent quota.
   }
@@ -739,10 +924,12 @@ async function rememberPendingTask(directory, taskId, record) {
 /** Drop one task from the ledger once its file is on disk. */
 async function forgetPendingTask(directory, taskId) {
   try {
-    const tasks = await readPendingTasks(directory)
-    if (tasks[taskId] === undefined) return
-    delete tasks[taskId]
-    await writePendingTasks(directory, tasks)
+    await withLedgerLock(directory, async () => {
+      const tasks = await readPendingTasks(directory)
+      if (tasks[taskId] === undefined) return
+      delete tasks[taskId]
+      await writePendingTasks(directory, tasks)
+    })
   } catch {
     // Advisory only.
   }
@@ -762,12 +949,25 @@ function videoExtensionOf(mediaType) {
 }
 
 /** Download one produced video into bytes plus its media type. */
-async function downloadVideo(url, signal) {
-  const response = await fetch(url, { signal })
-  if (!response.ok) {
-    throw new QwenImageError('downloading the generated video failed with HTTP ' + response.status, 'QWEN_VIDEO_DOWNLOAD_FAILED')
+async function downloadVideo(url, signal, maxBytes) {
+  let response
+  try {
+    response = await fetch(url, { signal })
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    throw new QwenImageError(
+      'downloading the generated video failed before a response: ' + (error?.message ?? String(error)),
+      'QWEN_VIDEO_NETWORK',
+    )
   }
-  const data = new Uint8Array(await response.arrayBuffer())
+  if (!response.ok) {
+    throw new QwenImageError(
+      'downloading the generated video failed with HTTP ' + response.status,
+      'QWEN_VIDEO_DOWNLOAD_FAILED',
+      response.status,
+    )
+  }
+  const data = await readBodyLimited(response, maxBytes, 'the generated video', 'maxVideoBytes', 'QWEN_VIDEO_DOWNLOAD_TOO_LARGE')
   if (data.byteLength === 0) {
     throw new QwenImageError('the downloaded video was empty', 'QWEN_VIDEO_DOWNLOAD_FAILED')
   }
@@ -819,6 +1019,36 @@ function retryDelay(error, pollIntervalMs) {
   return Math.min(pollIntervalMs * 2, MAX_RETRY_DELAY_MS)
 }
 
+/** A locally raised cancellation, shaped like the platform's AbortError. */
+function abortError(message = 'the tool call was cancelled') {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  return error
+}
+
+/** Whether a failed video download may be retried instead of surfaced. */
+function isTransientVideoError(error) {
+  if (error?.code === 'QWEN_VIDEO_NETWORK') return true
+  if (error?.code !== 'QWEN_VIDEO_DOWNLOAD_FAILED') return false
+  return error.status === 429 || (Number.isInteger(error.status) && error.status >= 500)
+}
+
+/**
+ * Run one video download with bounded retries. The render is already paid for,
+ * so a dropped transfer is retried here; the task id also stays in the ledger,
+ * which is what makes a still-failing download recoverable by a later call.
+ */
+async function withVideoRetry(run, signal) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run()
+    } catch (error) {
+      if (isAbortError(error) || !isTransientVideoError(error) || attempt >= MAX_VIDEO_DOWNLOAD_ATTEMPTS) throw error
+      await sleep(retryDelay(error, IMAGE_RETRY_DELAY_MS), signal)
+    }
+  }
+}
+
 /** Result returned when the render outlives this call's wait window. */
 function pendingVideoResult(taskId, options, status, note) {
   return {
@@ -834,6 +1064,9 @@ function pendingVideoResult(taskId, options, status, note) {
 /** Validate and normalize the model-supplied video arguments. */
 function parseVideoArgs(args, config) {
   if (args === null || typeof args !== 'object') throw new ImageArgsError('arguments must be an object')
+  if (args.output_dir !== undefined && typeof args.output_dir !== 'string') {
+    throw new ImageArgsError('output_dir must be a string')
+  }
   const taskId = isNonBlankString(args.task_id) ? args.task_id.trim() : undefined
   const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
   const rawMedia = args.media
@@ -915,7 +1148,7 @@ export function apply(ctx, rawConfig) {
       properties: {
         prompt: {
           type: 'string',
-          description: 'What to draw, as a full image description. Up to a few thousand tokens; longer prompts are truncated. Pass prompts instead to draw several different images in one call.',
+          description: 'What to draw, as a full image description. The service may truncate very long prompts. Pass prompts instead to draw several different images in one call.',
         },
         prompts: {
           type: 'array',
@@ -988,7 +1221,7 @@ export function apply(ctx, rawConfig) {
                 width: { type: 'integer', description: 'Pixel width reported by the service.' },
                 height: { type: 'integer', description: 'Pixel height reported by the service.' },
                 bytes: { type: 'integer', description: 'Saved byte size.' },
-                mediaType: { type: 'string', description: 'Saved image media type.' },
+                mediaType: { type: 'string', description: 'Media type recorded for the image: the saved file\'s type, or the attachment store\'s normalized type when the image is shown in chat.' },
                 attachmentId: { type: 'string', description: 'Durable attachment reference when the image is also shown in the chat.' },
                 attachmentBytes: { type: 'integer', description: 'Normalized attachment byte size; the chat image block uses this, not the saved file size.' },
                 promptIndex: { type: 'integer', description: 'Index of the prompt in prompts that produced this image (0 for a single prompt).' },
@@ -1040,11 +1273,17 @@ export function apply(ctx, rawConfig) {
       const options = parseArgs(args, config)
       const apiKey = await resolveApiKey(ctx, config.apiKeyEnv)
       const directory = await outputDirectory(ctx, config.outputDir, args.output_dir, exec, 'qwen-images')
-      const acceptsImages = await routeAcceptsImages(ctx, exec)
       const attachments = ctx.get('attachments')
+      // Only ask the model route about image input when an attachment could use it.
+      const acceptsImages = attachments !== undefined && await routeAcceptsImages(ctx, exec)
 
-      const timeout = AbortSignal.timeout(config.timeoutMs)
-      const signal = combineSignals(exec.signal, timeout)
+      // One call budget, minus a download reserve: a finished image must still be
+      // fetched after the budget expires, because its URL is short-lived and the
+      // generation was already billed.
+      const callDeadline = Date.now() + config.timeoutMs
+      const reserve = Math.min(DOWNLOAD_RESERVE_MS, Math.floor(config.timeoutMs / 4))
+      const generationTimeout = AbortSignal.timeout(Math.max(1_000, config.timeoutMs - reserve))
+      const signal = combineSignals(exec.signal, generationTimeout)
       const request = {
         baseUrl: config.baseUrl,
         apiKey,
@@ -1064,6 +1303,9 @@ export function apply(ctx, rawConfig) {
       // that instead of letting the caller believe the constraint took effect.
       if (options.negativePrompt !== undefined && !options.model.startsWith('qwen-image-3.')) {
         warnings.push('negative_prompt was not sent: only the qwen-image-3.0 series accepts it, so ' + options.model + ' ignored it - move the constraint into prompt or switch models.')
+      }
+      if (options.negativePromptWasTrimmed) {
+        warnings.push('negative_prompt was cut to its first 500 characters; shorten it so the whole constraint is sent.')
       }
 
       const prompts = options.prompts ?? [options.prompt]
@@ -1091,11 +1333,22 @@ export function apply(ctx, rawConfig) {
         }
       })
 
+      // A cancelled tool call is not a partial success: surface the cancellation
+      // so the host reports it as cancelled instead of returning warnings.
+      if (exec.signal?.aborted) {
+        const cancelled = batches.find((entry) => entry.status === 'rejected')
+        throw isAbortError(cancelled?.reason) ? cancelled.reason : abortError()
+      }
+
       const produced = []
       let rewriteStatus
-      for (const outcome of batches) {
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        const outcome = batches[batchIndex]
         if (outcome.status === 'rejected') {
-          warnings.push('one prompt request failed: ' + (outcome.reason?.message ?? String(outcome.reason)))
+          const reason = outcome.reason
+          warnings.push('prompt ' + (batchIndex + 1) + ' of ' + batches.length + ' failed: ' + (isAbortError(reason)
+            ? 'the ' + Math.round(config.timeoutMs / 1000) + 's image budget ran out before the service answered; split the call or raise timeoutMs'
+            : (reason?.message ?? String(reason))))
           continue
         }
         const { promptIndex, prompt, bodies } = outcome.value
@@ -1119,30 +1372,51 @@ export function apply(ctx, rawConfig) {
       if (produced.length === 0) {
         const firstFailure = batches.find((entry) => entry.status === 'rejected')
         if (firstFailure !== undefined) {
-          throw firstFailure.reason instanceof Error ? firstFailure.reason : new QwenImageError(String(firstFailure.reason), 'QWEN_IMAGE_REQUEST_FAILED')
+          const reason = firstFailure.reason
+          // A budget expiry deserves its own code: "split the batch" is
+          // actionable, a bare timeout exception is not.
+          if (generationTimeout.aborted && isAbortError(reason) && !exec.signal?.aborted) {
+            throw new QwenImageError(
+              'the ' + Math.round(config.timeoutMs / 1000) + 's image budget ran out before any image arrived; pass fewer prompts per call, retry later, or raise timeoutMs',
+              'QWEN_IMAGE_TIMEOUT',
+            )
+          }
+          throw reason instanceof Error ? reason : new QwenImageError(String(reason), 'QWEN_IMAGE_REQUEST_FAILED')
         }
         throw new QwenImageError('the service returned no image; retry with a different prompt or model', 'QWEN_IMAGE_NO_IMAGE')
       }
 
       await mkdir(directory, { recursive: true })
       const batch = stamp()
+      // Generation may have consumed its whole budget; the download phase gets
+      // its own short window so already paid images still reach the disk.
+      const downloadBudget = Math.min(DOWNLOAD_CEILING_MS, Math.max(DOWNLOAD_FLOOR_MS, callDeadline - Date.now()))
+      const downloadSignal = combineSignals(exec.signal, AbortSignal.timeout(downloadBudget))
       // Downloading is the slow half and the images are independent, so every
       // file is fetched at once; naming and writing stay sequential because the
       // exclusive-create name check is what keeps concurrent calls apart.
       const downloads = await Promise.all(produced.map(async (item) => {
         try {
-          const downloaded = await withImageRetry(() => downloadImage(item.source, signal), signal)
+          const downloaded = await withImageRetry(
+            () => downloadImage(item.source, downloadSignal, config.maxImageBytes),
+            downloadSignal,
+          )
           return { ...item, ...downloaded }
         } catch (error) {
           return { ...item, error }
         }
       }))
+      // A cancelled call must not finish as a failed download; report it as the
+      // cancellation it is.
+      if (exec.signal?.aborted) throw abortError()
 
       const saved = []
       const manifest = []
       for (const item of downloads) {
         if (item.error !== undefined) {
-          warnings.push('one image could not be downloaded: ' + (item.error?.message ?? String(item.error)))
+          warnings.push('image from ' + shortSource(item.source) + ' could not be downloaded: ' + (isAbortError(item.error)
+            ? 'the download window closed before the file arrived; the service URL may already have expired'
+            : (item.error?.message ?? String(item.error))))
           continue
         }
         const fallbackStem = 'qwen_' + batch + '_' + (item.slot + 1)
@@ -1163,7 +1437,9 @@ export function apply(ctx, rawConfig) {
             entry.attachmentBytes = ref.bytes
             entry.width = ref.width
             entry.height = ref.height
-            entry.mediaType = ref.mediaType
+            // Only replace the recorded type when the store reports one; the
+            // saved file keeps the extension of the type it was downloaded as.
+            if (isNonBlankString(ref.mediaType)) entry.mediaType = ref.mediaType
           } catch {
             // A refused attachment still leaves the saved file for the model to read.
           }
@@ -1179,6 +1455,7 @@ export function apply(ctx, rawConfig) {
         saved.push(entry)
         manifest.push({
           createdAt: new Date().toISOString(),
+          kind: 'image',
           file,
           prompt: item.prompt,
           promptIndex: item.promptIndex,
@@ -1196,12 +1473,17 @@ export function apply(ctx, rawConfig) {
         })
       }
       if (saved.length === 0) {
-        throw new QwenImageError('no image could be saved: every download failed', 'QWEN_IMAGE_DOWNLOAD_FAILED')
+        const failed = downloads.find((item) => item.error !== undefined)
+        throw new QwenImageError(
+          'no image could be saved: ' + (failed?.error?.message ?? 'every download failed')
+            + (failed?.source === undefined ? '' : ' (source: ' + shortSource(failed.source) + ')'),
+          'QWEN_IMAGE_DOWNLOAD_FAILED',
+        )
       }
 
-      const manifestPath = join(directory, MANIFEST_FILE)
+      let manifestPath = join(directory, MANIFEST_FILE)
       try {
-        await appendFile(manifestPath, manifest.map((line) => JSON.stringify(line)).join(String.fromCharCode(10)) + String.fromCharCode(10))
+        manifestPath = await appendManifest(directory, manifest)
       } catch (error) {
         warnings.push('the generation manifest could not be written: ' + (error?.message ?? String(error)))
       }
@@ -1331,31 +1613,45 @@ export function apply(ctx, rawConfig) {
             },
           },
           message: { type: 'string', description: 'Why the call returned without a file, when it did.' },
+          warnings: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Non-fatal notes: arguments ignored while resuming a task, or a finished render whose download still needs the task id.',
+          },
         },
       },
       render: (_args, value) => {
+        const blocks = []
         if (value.status === 'pending') {
-          return [{
+          blocks.push({
             type: 'text',
             text: '<videoTask model="' + value.model + '" taskId="' + value.taskId + '" status="pending">\n'
               + (value.message ?? 'The video is still rendering.') + '\n'
               + 'Call qwen_video_generate again with task_id "' + value.taskId + '" to keep waiting and download the finished MP4.\n'
               + '</videoTask>',
-          }]
+          })
+        } else {
+          const video = value.video
+          const details = [
+            video.bytes === undefined ? '' : video.bytes + ' bytes',
+            video.mediaType ?? '',
+            video.durationSeconds === undefined ? '' : video.durationSeconds + 's',
+            video.ratio ?? '',
+          ].filter((entry) => entry !== '').join(', ')
+          blocks.push({
+            type: 'text',
+            text: '<generatedVideo model="' + value.model + '" taskId="' + value.taskId + '">\n'
+              + '1. ' + video.path + (details === '' ? '' : ' (' + details + ')') + '\n'
+              + '</generatedVideo>',
+          })
         }
-        const video = value.video
-        const details = [
-          video.bytes === undefined ? '' : video.bytes + ' bytes',
-          video.mediaType ?? '',
-          video.durationSeconds === undefined ? '' : video.durationSeconds + 's',
-          video.ratio ?? '',
-        ].filter((entry) => entry !== '').join(', ')
-        return [{
-          type: 'text',
-          text: '<generatedVideo model="' + value.model + '" taskId="' + value.taskId + '">\n'
-            + '1. ' + video.path + (details === '' ? '' : ' (' + details + ')') + '\n'
-            + '</generatedVideo>',
-        }]
+        if (Array.isArray(value.warnings) && value.warnings.length > 0) {
+          blocks.push({
+            type: 'text',
+            text: '<warnings>' + String.fromCharCode(10) + value.warnings.map((warning) => '- ' + warning).join(String.fromCharCode(10)) + String.fromCharCode(10) + '</warnings>',
+          })
+        }
+        return blocks
       },
       presentationMeta: (_args, value) => (value.video === undefined
         ? { taskId: value.taskId }
@@ -1366,8 +1662,30 @@ export function apply(ctx, rawConfig) {
       const options = parseVideoArgs(args, config)
       const apiKey = await resolveApiKey(ctx, config.apiKeyEnv)
       const directory = await outputDirectory(ctx, config.outputDir, args.output_dir, exec, 'qwen-videos')
+      // Validate the endpoint before submitting: a malformed videoBaseUrl must
+      // fail before a billed task exists, not after it.
+      videoTaskUrl(config.videoBaseUrl, 'probe')
+
+      const warnings = []
+      if (options.waitSeconds * 1000 > HOST_DEFAULT_TIMEOUT_MS) {
+        warnings.push('wait_seconds is longer than the host default per-call timeout (' + Math.round(HOST_DEFAULT_TIMEOUT_MS / 1000) + 's); if the host kills this call, resume with the task_id it returned instead of resubmitting.')
+      }
+      const ledger = await readPendingTasks(directory)
+      const recorded = options.taskId === undefined ? undefined : ledger[options.taskId]
+      if (recorded !== undefined && isNonBlankString(recorded.model) && KNOWN_VIDEO_MODELS.includes(recorded.model)) {
+        // The ledger knows what was submitted: resuming by task id must not
+        // restate the model, and the result must not misreport it either.
+        if (isNonBlankString(args.model) && args.model.trim() !== recorded.model) {
+          warnings.push('model "' + args.model.trim() + '" was ignored on resume: task ' + options.taskId + ' was submitted with ' + recorded.model + '.')
+        }
+        options.model = recorded.model
+      }
+      if (options.taskId !== undefined && (options.prompt !== '' || options.media !== undefined)) {
+        warnings.push('task_id was given, so prompt/media were ignored; the already submitted task is polled as-is.')
+      }
 
       let taskId = options.taskId
+      let submission = recorded
       if (taskId === undefined) {
         const input = {}
         if (options.prompt !== '') input.prompt = options.prompt
@@ -1394,28 +1712,51 @@ export function apply(ctx, rawConfig) {
         if (options.promptExtend !== undefined) parameters.prompt_extend = options.promptExtend
         else if (needsExtend) parameters.prompt_extend = true
 
-        taskId = await submitVideoTask({
-          baseUrl: config.videoBaseUrl,
-          apiKey,
+        try {
+          taskId = await submitVideoTask({
+            baseUrl: config.videoBaseUrl,
+            apiKey,
+            model: options.model,
+            input,
+            parameters,
+            // A create call is quick: a budget under the host's kill window keeps
+            // its failure mode a clean timeout instead of a killed process.
+            signal: requestSignal(exec, Math.min(config.videoTimeoutMs, VIDEO_SUBMIT_BUDGET_MS)),
+          })
+        } catch (error) {
+          if (isAbortError(error) && !exec.signal?.aborted) {
+            throw new QwenImageError(
+              'the video submission timed out before a task id came back, so a task may exist and be billing; check the Token Plan console before resubmitting, because a resubmission is charged again',
+              'QWEN_VIDEO_SUBMIT_UNKNOWN',
+            )
+          }
+          throw error
+        }
+        submission = {
           model: options.model,
-          input,
+          prompt: options.prompt === '' ? undefined : options.prompt,
           parameters,
-          signal: requestSignal(exec, config.videoTimeoutMs),
-        })
+          submittedAt: new Date().toISOString(),
+        }
       }
 
       const taskUrl = videoTaskUrl(config.videoBaseUrl, taskId)
       const deadline = Date.now() + options.waitSeconds * 1000
+      await mkdir(directory, { recursive: true })
       // The task is billed the moment it is submitted, so its id is recorded
       // before the first poll: a killed process or a cancelled wait can resume
       // the render instead of paying for a second one.
-      await mkdir(directory, { recursive: true })
-      await rememberPendingTask(directory, taskId, {
-        model: options.model,
-        directory,
-        submittedAt: new Date().toISOString(),
-        prompt: options.prompt === '' ? undefined : options.prompt.slice(0, 200),
-      })
+      if (options.taskId === undefined || recorded === undefined) {
+        await rememberPendingTask(directory, taskId, {
+          model: options.model,
+          directory,
+          submittedAt: submission?.submittedAt ?? new Date().toISOString(),
+          prompt: options.prompt === '' ? undefined : options.prompt,
+          parameters: submission?.parameters,
+        })
+      }
+      const result = (value) => (warnings.length === 0 ? value : { ...value, warnings })
+      const pending = (taskStatus, note) => result(pendingVideoResult(taskId, options, taskStatus, note))
 
       let body
       let status
@@ -1426,7 +1767,7 @@ export function apply(ctx, rawConfig) {
         // request would overshoot wait_seconds by the whole request budget.
         const remaining = deadline - Date.now()
         if (remaining <= 0) {
-          return pendingVideoResult(taskId, options, status)
+          return pending(status)
         }
         try {
           body = await queryVideoTask(
@@ -1437,12 +1778,7 @@ export function apply(ctx, rawConfig) {
           failureStreak = 0
         } catch (error) {
           if (isAbortError(error)) {
-            return pendingVideoResult(
-              taskId,
-              options,
-              status,
-              'the wait was cancelled while the task was still rendering; the task id stays valid for 24 hours',
-            )
+            return pending(status, 'the wait was cancelled while the task was still rendering; the task id stays valid for 24 hours')
           }
           if (!isTransientQueryError(error) || failureStreak >= MAX_QUERY_FAILURES) throw error
           failureStreak += 1
@@ -1450,7 +1786,7 @@ export function apply(ctx, rawConfig) {
             await sleep(retryDelay(error, config.videoPollIntervalMs), exec.signal)
           } catch (sleepError) {
             if (isAbortError(sleepError)) {
-              return pendingVideoResult(taskId, options, status, 'the wait was cancelled while the task was still rendering')
+              return pending(status, 'the wait was cancelled while the task was still rendering')
             }
             throw sleepError
           }
@@ -1466,27 +1802,25 @@ export function apply(ctx, rawConfig) {
           )
         }
         if (status === 'UNKNOWN') {
-          // A single status-less answer is usually one malformed poll, not a dead
-          // render; only a run of them means the task cannot be recovered.
+          // A status-less answer is usually one malformed poll, not a dead render.
+          // A long run of them means polling cannot make progress, but the task
+          // may still be rendering and billing: keep its id in the ledger and let
+          // the caller decide instead of dropping the only proof of the charge.
           unknownStreak += 1
           if (unknownStreak > MAX_UNKNOWN_POLLS) {
-            await forgetPendingTask(directory, taskId)
-            throw new QwenImageError(
-              'video task ' + taskId + ' never reported a status: ' + videoTaskFailure(body),
-              'QWEN_VIDEO_TASK_FAILED',
-            )
+            return pending(status, 'the service kept answering without a task status; the task id stays valid for 24 hours, so retry with task_id "' + taskId + '" before resubmitting')
           }
         } else {
           unknownStreak = 0
         }
         if (Date.now() + config.videoPollIntervalMs > deadline) {
-          return pendingVideoResult(taskId, options, status)
+          return pending(status)
         }
         try {
           await sleep(config.videoPollIntervalMs, exec.signal)
         } catch (error) {
           if (isAbortError(error)) {
-            return pendingVideoResult(taskId, options, status, 'the wait was cancelled while the task was still rendering')
+            return pending(status, 'the wait was cancelled while the task was still rendering')
           }
           throw error
         }
@@ -1494,9 +1828,29 @@ export function apply(ctx, rawConfig) {
 
       const source = videoSourceOf(body)
       if (source === undefined) {
+        await forgetPendingTask(directory, taskId)
         throw new QwenImageError('the finished video task carried no video URL', 'QWEN_VIDEO_NO_VIDEO')
       }
-      const { data, mediaType } = await downloadVideo(source, requestSignal(exec, config.videoTimeoutMs))
+      let downloaded
+      try {
+        downloaded = await withVideoRetry(
+          () => downloadVideo(source, requestSignal(exec, Math.min(config.videoTimeoutMs, VIDEO_DOWNLOAD_BUDGET_MS)), config.maxVideoBytes),
+          exec.signal,
+        )
+      } catch (error) {
+        if (isAbortError(error)) {
+          // The render finished and was billed; the ledger keeps its id so a
+          // later call can fetch the file without paying for a second render.
+          return result(pendingVideoResult(
+            taskId,
+            options,
+            'SUCCEEDED',
+            'the video finished rendering but the download was interrupted; call qwen_video_generate again with task_id "' + taskId + '" to fetch it (no new render, no new charge)',
+          ))
+        }
+        throw error
+      }
+      const { data, mediaType } = downloaded
       const file = await writeUniqueFile(directory, 'video_' + stamp() + '_1', videoExtensionOf(mediaType), data)
       await forgetPendingTask(directory, taskId)
       const video = { path: file, bytes: data.byteLength, mediaType }
@@ -1505,7 +1859,33 @@ export function apply(ctx, rawConfig) {
       if (Number.isInteger(durationSeconds)) video.durationSeconds = durationSeconds
       const ratio = usage.video_ratio ?? usage.ratio
       if (isNonBlankString(ratio)) video.ratio = ratio
-      return { model: options.model, taskId, status: 'succeeded', video }
+      const parameters = submission?.parameters ?? {}
+      const record = {
+        createdAt: new Date().toISOString(),
+        kind: 'video',
+        file,
+        taskId,
+        model: options.model,
+        prompt: submission?.prompt,
+        resolution: parameters.resolution,
+        duration: parameters.duration,
+        ratio: parameters.ratio,
+        seed: parameters.seed,
+        audio: parameters.audio,
+        watermark: parameters.watermark,
+        promptExtend: parameters.prompt_extend,
+        requestId: body?.request_id,
+        bytes: video.bytes,
+        mediaType: video.mediaType,
+        durationSeconds: video.durationSeconds,
+        renderedRatio: video.ratio,
+      }
+      try {
+        await appendManifest(directory, [record])
+      } catch (error) {
+        warnings.push('the generation manifest could not be written: ' + (error?.message ?? String(error)))
+      }
+      return result({ model: options.model, taskId, status: 'succeeded', video })
     },
     presentCall(args) {
       const input = args !== null && typeof args === 'object' ? args : {}
